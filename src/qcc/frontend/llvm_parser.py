@@ -1,15 +1,14 @@
-"""Small, strict parser for the v0.1 textual LLVM subset.
+"""Small, strict parser for the bounded textual LLVM subset.
 
 LLVM's textual format is intentionally broad and changes slightly between
 Clang releases. This parser therefore ignores harmless module attributes and
 metadata declarations, but validates every instruction it sees. The accepted
-program shape is an integer-typed function with one straight-line basic block.
+program shape is an integer-typed function with an acyclic control-flow graph.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 from qcc.errors import LLVMParseError, SourceLocation, UnsupportedConstructError
@@ -23,6 +22,7 @@ from qcc.ir.ssa import (
     MetadataAttachment,
     Module,
     Parameter,
+    PhiIncoming,
     SSAValue,
     VoidType,
 )
@@ -53,6 +53,8 @@ _PUNCTUATION = frozenset("=,(){}[]<>*:")
 _INTEGER_RE = re.compile(r"^[+-]?(?:0[xX][0-9a-fA-F]+|[0-9]+)$")
 _SSA_RE = re.compile(r"^%(?:[A-Za-z$._-][A-Za-z0-9$._-]*|[0-9]+|\"(?:[^\"\\]|\\.)*\")$")
 _TYPE_RE = re.compile(r"^i([1-9][0-9]*)$")
+_BLOCK_NAME_PATTERN = r'(?:[A-Za-z$._-][A-Za-z0-9$._-]*|[0-9]+|"(?:[^"\\]|\\.)*")'
+_BLOCK_LABEL_RE = re.compile(rf"^(?P<name>{_BLOCK_NAME_PATTERN}):$")
 _FLOAT_WORD_RE = re.compile(
     r"(?:^|\s)(?:half|bfloat|float|double|fp128|x86_fp80)(?:\s|$)"
 )
@@ -65,7 +67,6 @@ _ICMP_PREDICATES = frozenset(
 )
 _CONTROL_FLOW_OPS = frozenset(
     {
-        "br",
         "switch",
         "indirectbr",
         "invoke",
@@ -90,8 +91,6 @@ _UNSUPPORTED_OPS = frozenset(
         "shl",
         "lshr",
         "ashr",
-        "select",
-        "phi",
         "extractvalue",
         "insertvalue",
         "extractelement",
@@ -412,15 +411,21 @@ def _extract_metadata(
 def _operand(
     text: str,
     expected_type: IntType,
-    values: Mapping[str, SSAValue],
+    values: dict[str, SSAValue],
     location: SourceLocation,
+    *,
+    forward_names: set[str] | None = None,
 ) -> SSAValue | IntConstant:
     value = text.strip()
     if value.startswith("%"):
         name = _ssa_name(value, location)
         result = values.get(name)
         if result is None:
-            raise LLVMParseError(f"use of undefined SSA value {value}", location)
+            if forward_names is None:
+                raise LLVMParseError(f"use of undefined SSA value {value}", location)
+            result = SSAValue(name, expected_type)
+            values[name] = result
+            forward_names.add(name)
         if result.type != expected_type:
             raise LLVMParseError(
                 f"SSA value {value} has type {result.type}, expected {expected_type}",
@@ -464,39 +469,50 @@ def _result(
     result_type: IntType,
     values: dict[str, SSAValue],
     location: SourceLocation,
+    *,
+    forward_names: set[str] | None = None,
 ) -> SSAValue:
     if lhs is None:
         raise LLVMParseError(
             "value-producing instruction is missing an SSA result", location
         )
     name = _ssa_name(lhs, location)
-    if name in values:
-        raise LLVMParseError(f"SSA value %{name} is defined more than once", location)
+    existing = values.get(name)
+    if existing is not None:
+        if forward_names is None or name not in forward_names:
+            raise LLVMParseError(
+                f"SSA value %{name} is defined more than once", location
+            )
+        if existing.type != result_type:
+            raise LLVMParseError(
+                f"forward SSA value %{name} has type {existing.type}, "
+                f"defined as {result_type}",
+                location,
+            )
+        forward_names.remove(name)
     value = SSAValue(name, result_type)
     values[name] = value
     return value
 
 
 def _unsupported_opcode(opcode: str, location: SourceLocation) -> None:
-    if opcode in _CONTROL_FLOW_OPS:
+    if opcode == "call" or opcode.endswith("call") or opcode in {"invoke", "callbr"}:
         message = (
-            f"unsupported LLVM instruction {opcode!r}; branches, multiple "
-            "basic blocks, "
-            "and cyclic control flow are not supported in v0.1"
+            f"unsupported LLVM instruction {opcode!r}; function calls are not "
+            "supported in the integer v0.2 frontend"
+        )
+    elif opcode in _CONTROL_FLOW_OPS:
+        message = (
+            f"unsupported LLVM instruction {opcode!r}; only br/ret control flow "
+            "with an acyclic CFG is supported in v0.2"
         )
     elif opcode in _MEMORY_OPS:
         message = (
-            f"unsupported LLVM instruction {opcode!r}; loads, stores, pointers, and "
-            "memory operations are not supported in v0.1"
-        )
-    elif opcode == "call" or opcode.endswith("call"):
-        message = (
-            f"unsupported LLVM instruction {opcode!r}; function calls are not "
-            "supported "
-            "in the straight-line v0.1 subset"
+            f"unsupported LLVM instruction {opcode!r}; loads, stores, pointers, "
+            "and memory operations are not supported in the integer v0.2 frontend"
         )
     elif opcode in _UNSUPPORTED_OPS:
-        message = f"unsupported LLVM instruction {opcode!r} in the v0.1 integer subset"
+        message = f"unsupported LLVM instruction {opcode!r} in the v0.2 integer subset"
     else:
         raise UnsupportedConstructError(
             f"unknown LLVM instruction {opcode!r}",
@@ -507,6 +523,39 @@ def _unsupported_opcode(opcode: str, location: SourceLocation) -> None:
     raise UnsupportedConstructError(f"LLVM instruction {opcode!r}", message, location)
 
 
+def _block_name(value: str, location: SourceLocation) -> str:
+    """Parse an LLVM block reference such as ``%then``."""
+
+    value = value.strip()
+    if not value.startswith("%"):
+        raise LLVMParseError(f"expected a basic-block label, got {value!r}", location)
+    raw = value[1:]
+    if re.fullmatch(_BLOCK_NAME_PATTERN, raw) is None:
+        raise LLVMParseError(f"invalid basic-block label {value!r}", location)
+    return _normalize_name(value)
+
+
+def _label_target(value: str, location: SourceLocation) -> str:
+    match = re.fullmatch(r"label\s+(.+)", value.strip())
+    if match is None:
+        raise LLVMParseError(f"expected a label target, got {value!r}", location)
+    return _block_name(match.group(1), location)
+
+
+def _typed_operand(
+    text: str,
+    values: dict[str, SSAValue],
+    location: SourceLocation,
+) -> tuple[IntType, SSAValue | IntConstant]:
+    match = re.match(r"^(?P<type>i[1-9][0-9]*)\s+(?P<operand>.+)$", text.strip())
+    if match is None:
+        raise LLVMParseError(
+            f"expected a typed integer operand, got {text!r}", location
+        )
+    value_type = _parse_type(match.group("type"), location)
+    return value_type, _operand(match.group("operand"), value_type, values, location)
+
+
 def _parse_instruction(
     line: str,
     *,
@@ -514,6 +563,7 @@ def _parse_instruction(
     line_number: int,
     values: dict[str, SSAValue],
     function_return_type: IntType | VoidType,
+    forward_names: set[str] | None = None,
 ) -> Instruction:
     base, metadata = _extract_metadata(
         line.strip(),
@@ -528,6 +578,9 @@ def _parse_instruction(
     else:
         body = base
 
+    if re.match(r"^(?:(?:tail|musttail|notail)\s+)?call(?:\s|$)", body):
+        _unsupported_opcode("call", location)
+
     opcode_match = re.match(r"^([A-Za-z][A-Za-z0-9_.-]*)(?:\s+(.*))?$", body)
     if opcode_match is None:
         raise LLVMParseError(f"malformed LLVM instruction {line.strip()!r}", location)
@@ -537,13 +590,15 @@ def _parse_instruction(
     if _FLOAT_WORD_RE.search(rest) or (opcode.startswith("f") and opcode != "freeze"):
         raise UnsupportedConstructError(
             "floating-point instruction",
-            f"floating-point instruction {opcode!r} is not supported in v0.1",
+            f"floating-point instruction {opcode!r} is not supported in the "
+            "integer v0.2 frontend",
             location,
         )
     if _VECTOR_RE.search(rest):
         raise UnsupportedConstructError(
             "vector instruction",
-            f"vector operands or results in {opcode!r} are not supported in v0.1",
+            f"vector operands or results in {opcode!r} are not supported in "
+            "the integer v0.2 frontend",
             location,
         )
 
@@ -562,7 +617,9 @@ def _parse_instruction(
         binary_operands = tuple(
             _operand(item, value_type, values, location) for item in operands_text
         )
-        result = _result(result_name, value_type, values, location)
+        result = _result(
+            result_name, value_type, values, location, forward_names=forward_names
+        )
         flags = tuple((match.group("flags") or "").split())
         return Instruction(
             opcode,
@@ -596,7 +653,9 @@ def _parse_instruction(
                 location,
             )
         operand = _operand(match.group("operand"), source_type, values, location)
-        result = _result(result_name, target_type, values, location)
+        result = _result(
+            result_name, target_type, values, location, forward_names=forward_names
+        )
         return Instruction(
             opcode,
             result=result,
@@ -621,17 +680,20 @@ def _parse_instruction(
         if predicate not in _ICMP_PREDICATES:
             raise UnsupportedConstructError(
                 f"icmp predicate {predicate!r}",
-                f"icmp predicate {predicate!r} is not supported in v0.1",
+                f"icmp predicate {predicate!r} is not supported in the "
+                "integer v0.2 frontend",
                 location,
             )
         value_type = _parse_type(match.group("type"), location)
         operands_text = _split_top_level(match.group("operands"))
-        if len(operands_text) != 2:
+        if len(operands_text) != 2 or any(not item for item in operands_text):
             raise LLVMParseError("icmp expects two operands", location)
         icmp_operands = tuple(
             _operand(item, value_type, values, location) for item in operands_text
         )
-        result = _result(result_name, IntType(1), values, location)
+        result = _result(
+            result_name, IntType(1), values, location, forward_names=forward_names
+        )
         return Instruction(
             "icmp",
             result=result,
@@ -644,12 +706,120 @@ def _parse_instruction(
             metadata=metadata,
         )
 
+    if opcode == "select":
+        if result_name is None:
+            raise LLVMParseError("select cannot omit its SSA result", location)
+        parts = _split_top_level(rest)
+        if len(parts) != 3 or any(not item for item in parts):
+            raise LLVMParseError("select expects a condition and two values", location)
+        condition_type, condition = _typed_operand(parts[0], values, location)
+        if condition_type != IntType(1):
+            raise LLVMParseError(
+                f"select condition must have type i1, got {condition_type}", location
+            )
+        true_type, true_value = _typed_operand(parts[1], values, location)
+        false_type, false_value = _typed_operand(parts[2], values, location)
+        if true_type != false_type:
+            raise LLVMParseError(
+                f"select values have different types {true_type} and {false_type}",
+                location,
+            )
+        result = _result(
+            result_name, true_type, values, location, forward_names=forward_names
+        )
+        return Instruction(
+            "select",
+            result=result,
+            type=true_type,
+            operands=(condition, true_value, false_value),
+            source_location=location,
+            metadata=metadata,
+        )
+
+    if opcode == "phi":
+        if result_name is None:
+            raise LLVMParseError("phi cannot omit its SSA result", location)
+        match = re.match(
+            r"^(?P<type>i[1-9][0-9]*)\s+(?P<incoming>.+)$",
+            rest,
+        )
+        if match is None:
+            raise LLVMParseError("malformed phi instruction", location)
+        value_type = _parse_type(match.group("type"), location)
+        incoming: list[PhiIncoming] = []
+        phi_operands: list[SSAValue | IntConstant] = []
+        for item in _split_top_level(match.group("incoming")):
+            if len(item) < 2 or not item.startswith("[") or not item.endswith("]"):
+                raise LLVMParseError(f"malformed phi incoming edge {item!r}", location)
+            pair = _split_top_level(item[1:-1])
+            if len(pair) != 2 or any(not value.strip() for value in pair):
+                raise LLVMParseError(f"malformed phi incoming edge {item!r}", location)
+            value = _operand(
+                pair[0],
+                value_type,
+                values,
+                location,
+                forward_names=forward_names,
+            )
+            block = _block_name(pair[1], location)
+            phi_operands.append(value)
+            incoming.append(PhiIncoming(value, block, location))
+        if not incoming:
+            raise LLVMParseError("phi expects at least one incoming edge", location)
+        result = _result(
+            result_name, value_type, values, location, forward_names=forward_names
+        )
+        return Instruction(
+            "phi",
+            result=result,
+            type=value_type,
+            operands=tuple(phi_operands),
+            source_location=location,
+            metadata=metadata,
+            incoming=tuple(incoming),
+        )
+
+    if opcode == "br":
+        if result_name is not None:
+            raise LLVMParseError("br cannot define an SSA result", location)
+        parts = _split_top_level(rest)
+        if len(parts) == 1:
+            target = _label_target(parts[0], location)
+            return Instruction(
+                "br",
+                source_location=location,
+                metadata=metadata,
+                targets=(target,),
+            )
+        if len(parts) != 3:
+            raise LLVMParseError(
+                "br expects one label or an i1 condition and two labels", location
+            )
+        condition_type, condition = _typed_operand(parts[0], values, location)
+        if condition_type != IntType(1):
+            raise LLVMParseError(
+                f"br condition must have type i1, got {condition_type}", location
+            )
+        targets = (_label_target(parts[1], location), _label_target(parts[2], location))
+        if targets[0] == targets[1]:
+            raise LLVMParseError(
+                "conditional br must name two distinct destination blocks", location
+            )
+        return Instruction(
+            "br",
+            type=IntType(1),
+            operands=(condition,),
+            source_location=location,
+            metadata=metadata,
+            targets=targets,
+        )
+
     if opcode == "ret":
         if result_name is not None:
             raise LLVMParseError("ret cannot define an SSA result", location)
         if rest.strip() == "void":
             return_type: IntType | VoidType = VoidType()
-            operands: tuple[SSAValue | IntConstant, ...] = ()
+            return_operands: tuple[SSAValue | IntConstant, ...] = ()
         else:
             match = re.match(
                 r"^(?P<type>i[1-9][0-9]*)\s+(?P<operand>.+)$",
@@ -660,7 +830,7 @@ def _parse_instruction(
                     "ret must return an integer value or void", location
                 )
             return_type = _parse_type(match.group("type"), location)
-            operands = (
+            return_operands = (
                 _operand(match.group("operand"), return_type, values, location),
             )
         if return_type != function_return_type:
@@ -672,7 +842,7 @@ def _parse_instruction(
         return Instruction(
             "ret",
             type=return_type,
-            operands=operands,
+            operands=return_operands,
             source_location=location,
             metadata=metadata,
         )
@@ -835,6 +1005,94 @@ def _parse_function_header(
     return name, return_type, parameters, attributes, location
 
 
+def _validate_function(function: Function) -> None:
+    """Validate CFG edges, phi predecessor sets, and acyclicity."""
+
+    block_names = {block.name for block in function.blocks}
+    for block in function.blocks:
+        terminator = block.terminator
+        if terminator is None:
+            location = block.location or function.location
+            raise LLVMParseError(
+                f"basic block %{block.name} does not end in a terminator",
+                location,
+            )
+        if terminator.opcode == "br":
+            for target in terminator.targets:
+                if target not in block_names:
+                    raise LLVMParseError(
+                        f"branch from %{block.name} targets undefined basic "
+                        f"block %{target}",
+                        terminator.location or block.location,
+                    )
+
+    state: dict[str, int] = {}
+
+    def visit(block: BasicBlock) -> None:
+        state[block.name] = 1
+        for target in block.successors:
+            target_state = state.get(target, 0)
+            if target_state == 1:
+                terminator = block.terminator
+                location = (
+                    terminator.location
+                    if terminator is not None
+                    else block.location or function.location
+                )
+                raise UnsupportedConstructError(
+                    "cyclic control flow",
+                    "cyclic control flow (data-dependent loop) is not supported "
+                    f"in v0.2; branch from %{block.name} to %{target} creates a cycle",
+                    location,
+                )
+            if target_state == 0:
+                visit(function.get_block(target))
+        state[block.name] = 2
+
+    for block in function.blocks:
+        if state.get(block.name, 0) == 0:
+            visit(block)
+
+    for block in function.blocks:
+        predecessors = set(function.predecessor_names(block))
+        for instruction in block.instructions:
+            if instruction.opcode != "phi":
+                continue
+            seen_incoming: set[str] = set()
+            for edge in instruction.incoming:
+                if edge.block in seen_incoming:
+                    raise LLVMParseError(
+                        f"phi in %{block.name} lists predecessor %{edge.block} "
+                        "more than once",
+                        instruction.location or block.location,
+                    )
+                seen_incoming.add(edge.block)
+                if edge.block not in block_names:
+                    raise LLVMParseError(
+                        f"phi in %{block.name} references undefined basic "
+                        f"block %{edge.block}",
+                        instruction.location or block.location,
+                    )
+            if seen_incoming != predecessors:
+                missing = sorted(predecessors - seen_incoming)
+                extra = sorted(seen_incoming - predecessors)
+                details: list[str] = []
+                if missing:
+                    details.append(
+                        "missing " + ", ".join(f"%{name}" for name in missing)
+                    )
+                if extra:
+                    details.append(
+                        "not-predecessors " + ", ".join(f"%{name}" for name in extra)
+                    )
+                detail = "; ".join(details)
+                raise LLVMParseError(
+                    f"phi in %{block.name} does not match CFG predecessors"
+                    + (f" ({detail})" if detail else ""),
+                    instruction.location or block.location,
+                )
+
+
 def _parse_function(
     lines: list[str],
     start: int,
@@ -862,11 +1120,27 @@ def _parse_function(
     values: dict[str, SSAValue] = {
         parameter.name: parameter for parameter in parameters
     }
+    forward_names: set[str] = set()
     block_name = "entry"
     block_location = function_location
     instructions: list[Instruction] = []
-    saw_label = False
-    saw_return = False
+    blocks: list[BasicBlock] = []
+    seen_labels: set[str] = set()
+    has_explicit_label = False
+
+    def finish_current(location: SourceLocation) -> None:
+        if not instructions:
+            if has_explicit_label:
+                raise LLVMParseError(f"basic block %{block_name} is empty", location)
+            return
+        terminator = instructions[-1]
+        if not terminator.is_terminator:
+            raise LLVMParseError(
+                f"basic block %{block_name} does not end in a terminator",
+                terminator.location or location,
+            )
+        blocks.append(BasicBlock(block_name, tuple(instructions), block_location))
+
     cursor += 1
     while cursor < len(lines):
         current = _strip_comment(lines[cursor])
@@ -876,43 +1150,53 @@ def _parse_function(
             cursor += 1
             continue
         if stripped == "}":
-            if not saw_return:
+            finish_current(_location(source_name, current_line, current))
+            if not blocks:
                 raise LLVMParseError(
-                    f"function @{name} ends without a return instruction",
+                    f"function @{name} has no basic blocks",
                     _location(source_name, current_line, current),
                 )
-            block = BasicBlock(block_name, tuple(instructions), block_location)
-            return (
-                Function(
-                    name,
-                    return_type,
-                    parameters,
-                    (block,),
-                    attributes,
-                    function_location,
-                ),
-                cursor + 1,
+            if forward_names:
+                missing = ", ".join(f"%{name}" for name in sorted(forward_names))
+                raise LLVMParseError(
+                    f"use of undefined forward SSA value(s) {missing}",
+                    _location(source_name, current_line, current),
+                )
+            function = Function(
+                name,
+                return_type,
+                parameters,
+                tuple(blocks),
+                attributes,
+                function_location,
             )
-        label_match = re.fullmatch(
-            r"([A-Za-z$._-][A-Za-z0-9$._-]*|[0-9]+):",
-            stripped,
-        )
+            _validate_function(function)
+            return function, cursor + 1
+
+        label_match = _BLOCK_LABEL_RE.fullmatch(stripped)
         if label_match is not None:
-            if saw_label:
-                raise UnsupportedConstructError(
-                    "multiple basic blocks",
-                    "multiple basic blocks and branches/cycles are not supported "
-                    "in v0.1",
-                    _location(source_name, current_line, current),
+            label = _normalize_name(label_match.group("name"), "")
+            label_location = _location(source_name, current_line, current)
+            if label in seen_labels or (
+                not has_explicit_label and instructions and label == block_name
+            ):
+                raise LLVMParseError(
+                    f"basic block %{label} is defined more than once",
+                    label_location,
                 )
-            saw_label = True
-            block_name = label_match.group(1)
-            block_location = _location(source_name, current_line, current)
+            if instructions or has_explicit_label:
+                finish_current(label_location)
+            seen_labels.add(label)
+            block_name = label
+            block_location = label_location
+            instructions = []
+            has_explicit_label = True
             cursor += 1
             continue
-        if saw_return:
+
+        if instructions and instructions[-1].is_terminator:
             raise LLVMParseError(
-                "instructions are not allowed after a return terminator",
+                "instructions are not allowed after a terminator without a label",
                 _location(source_name, current_line, current),
             )
         instruction = _parse_instruction(
@@ -921,9 +1205,16 @@ def _parse_function(
             line_number=current_line,
             values=values,
             function_return_type=return_type,
+            forward_names=forward_names,
         )
+        if instruction.opcode == "phi" and any(
+            existing.opcode != "phi" for existing in instructions
+        ):
+            raise LLVMParseError(
+                "phi instructions must appear before other instructions in a block",
+                instruction.location,
+            )
         instructions.append(instruction)
-        saw_return = instruction.opcode == "ret"
         cursor += 1
 
     raise LLVMParseError(
@@ -933,7 +1224,7 @@ def _parse_function(
 
 
 def parse_module(text: str, source_name: str = "<llvm>") -> Module:
-    """Parse v0.1 integer straight-line LLVM IR into a :class:`Module`."""
+    """Parse bounded integer LLVM IR into a :class:`Module`."""
 
     if not isinstance(text, str):
         raise TypeError("LLVM input must be text")
