@@ -5,6 +5,8 @@ from __future__ import annotations
 from itertools import product
 
 import pytest
+
+from qcc import CircuitBuilder, CircuitLayout
 from qcc.lib.compare import (
     bitwise_equal,
     compare_flags,
@@ -20,8 +22,6 @@ from qcc.lib.shift import (
     shift_left,
     shift_right,
 )
-
-from qcc import CircuitBuilder, CircuitLayout
 from qcc.lower.bennett import GateBuffer
 from qcc.sim.classical import read_register, simulate
 
