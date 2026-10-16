@@ -761,6 +761,15 @@ class Circuit:
     def resource_counts(self) -> ResourceCounts:
         return self.resources()
 
+    def report(self) -> Any:
+        """Return the backend-neutral resource report for this circuit."""
+
+        from qcc.backend.report import resource_report
+
+        return resource_report(self)
+
+    resource_report = report
+
     @property
     def depth(self) -> int:
         return self._depth()
