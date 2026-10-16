@@ -1,9 +1,4 @@
-"""Core reversible-circuit building blocks for qcc.
-
-Frontend, lowering, command-line, and public compilation APIs live in other
-subsystems.  This package currently exposes only the circuit IR, simulator,
-and arithmetic helpers.
-"""
+"""Public building blocks and diagnostics for the qcc compiler."""
 
 from qcc.ir.netlist import (
     Circuit,
@@ -14,6 +9,15 @@ from qcc.ir.netlist import (
     QubitAllocator,
     ResourceCounts,
 )
+from qcc.errors import (
+    ClangCompilationError,
+    ClangNotFoundError,
+    CompilerError,
+    Diagnostic,
+    LLVMParseError,
+    SourceLocation,
+    UnsupportedConstructError,
+)
 
 __all__ = [
     "Circuit",
@@ -23,4 +27,11 @@ __all__ = [
     "Qubit",
     "QubitAllocator",
     "ResourceCounts",
+    "ClangCompilationError",
+    "ClangNotFoundError",
+    "CompilerError",
+    "Diagnostic",
+    "LLVMParseError",
+    "SourceLocation",
+    "UnsupportedConstructError",
 ]
