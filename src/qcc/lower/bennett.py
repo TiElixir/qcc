@@ -245,6 +245,74 @@ def _append_modular_addition(
     return carry
 
 
+def _append_addition_with_carry(
+    emitter: GateBuffer,
+    source: Register,
+    target: Register,
+    carry_in: int,
+    carry_out: int,
+) -> None:
+    """Append ``target += source + carry_in`` and toggle ``carry_out``.
+
+    This is the carry-out form of the same Cuccaro ripple used by the
+    modular adder.  The source, incoming carry, and target are restored or
+    updated in place, while the outgoing carry is XORed with the final carry.
+    Keeping the primitive here lets the lowering pass build comparisons
+    without depending on the public arithmetic-library API.
+    """
+
+    _check_same_width(source, target, "addition with carry")
+    source_bits = source.bits
+    target_bits = target.bits
+
+    def majority(first: int, second: int, incoming: int) -> None:
+        emitter.cx(first, second)
+        emitter.cx(first, incoming)
+        emitter.ccx(second, incoming, first)
+
+    def unmajority_add(first: int, second: int, incoming: int) -> None:
+        emitter.ccx(second, incoming, first)
+        emitter.cx(first, incoming)
+        emitter.cx(incoming, second)
+
+    majority(source_bits[0], target_bits[0], carry_in)
+    for index in range(1, source.width):
+        majority(source_bits[index], target_bits[index], source_bits[index - 1])
+    emitter.cx(source_bits[-1], carry_out)
+    for index in range(source.width - 1, 0, -1):
+        unmajority_add(source_bits[index], target_bits[index], source_bits[index - 1])
+    unmajority_add(source_bits[0], target_bits[0], carry_in)
+
+
+def sub_with_borrow(
+    emitter: GateBuffer,
+    subtrahend: Register,
+    target: Register,
+    borrow_in: int,
+    borrow_out: int,
+) -> None:
+    """Append ``target -= subtrahend + borrow_in`` with a borrow flag.
+
+    ``borrow_in`` is preserved and ``borrow_out`` is toggled exactly when the
+    unsigned subtraction borrows.  The target and subtrahend are otherwise
+    treated like the public subtraction helper, making this useful as a
+    reversible unsigned-comparison primitive.
+    """
+
+    _check_same_width(subtrahend, target, "subtraction with borrow")
+    for qubit in target.bits:
+        emitter.x(qubit)
+    _append_addition_with_carry(
+        emitter,
+        subtrahend,
+        target,
+        borrow_in,
+        borrow_out,
+    )
+    for qubit in target.bits:
+        emitter.x(qubit)
+
+
 def add_modular(
     emitter: GateBuffer,
     source: Register,
@@ -360,5 +428,6 @@ __all__ = [
     "or_bits",
     "sub_modular",
     "sub_registers",
+    "sub_with_borrow",
     "xor_bits",
 ]
