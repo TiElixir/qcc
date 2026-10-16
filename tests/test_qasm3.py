@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 from qcc.backend.qasm3 import (
-    UnsupportedGateError,
+    MCXDecompositionError,
     emit_qasm3,
     validate_qasm3,
 )
@@ -72,8 +72,20 @@ def test_qasm3_validation_rejects_bad_ranges_and_unknown_gates() -> None:
         validate_qasm3('OPENQASM 3.0;\ninclude "stdgates.inc";\nqubit q;\nh q;\n')
 
 
-def test_mcx_is_rejected_with_a_decomposition_diagnostic() -> None:
+def test_mcx_is_decomposed_with_a_named_clean_ancilla() -> None:
+    circuit = CircuitFixture(
+        LayoutFixture((("data", 4), ("ancilla", 1))), (("mcx", 0, 1, 2, 3),)
+    )
+
+    qasm = emit_qasm3(circuit)
+
+    assert "mcx" not in qasm
+    assert qasm.count("ccx ") == 3
+    assert validate_qasm3(qasm)
+
+
+def test_mcx_without_the_required_clean_ancilla_has_a_strict_error() -> None:
     circuit = CircuitFixture(LayoutFixture((("q", 4),)), (("mcx", 0, 1, 2, 3),))
 
-    with pytest.raises(UnsupportedGateError, match="decompose"):
+    with pytest.raises(MCXDecompositionError, match="clean ancilla"):
         emit_qasm3(circuit)

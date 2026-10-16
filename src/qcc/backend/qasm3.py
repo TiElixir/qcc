@@ -28,6 +28,10 @@ class UnsupportedGateError(QASM3Error):
     """A circuit contains a gate outside the supported OpenQASM subset."""
 
 
+class MCXDecompositionError(UnsupportedGateError):
+    """An MCX cannot be lowered under the backend's clean-ancilla contract."""
+
+
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REGISTER = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\[(?P<index>[0-9]+)\]$")
 _QREG = re.compile(
@@ -47,6 +51,9 @@ _GATE_ALIASES = {
     "ccx": "ccx",
     "toffoli": "ccx",
     "controlled_controlled_x": "ccx",
+    "mcx": "mcx",
+    "multi_controlled_x": "mcx",
+    "multi_x": "mcx",
 }
 
 
@@ -60,6 +67,45 @@ class _Register:
 class _Operation:
     name: str
     qubits: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class _BoolExpression:
+    """A compact symbolic Boolean expression in XOR-normal form."""
+
+    terms: frozenset[_BoolAtom]
+
+
+@dataclass(frozen=True)
+class _BoolAtom:
+    """One opaque variable, constant, or conjunction in an expression."""
+
+    kind: str
+    key: tuple[Any, ...] = ()
+
+
+_ZERO = _BoolExpression(frozenset())
+_ONE_ATOM = _BoolAtom("one")
+_ONE = _BoolExpression(frozenset({_ONE_ATOM}))
+
+
+def _xor_expression(first: _BoolExpression, second: _BoolExpression) -> _BoolExpression:
+    return _BoolExpression(first.terms.symmetric_difference(second.terms))
+
+
+def _and_expression(values: Sequence[_BoolExpression]) -> _BoolExpression:
+    if any(value == _ZERO for value in values):
+        return _ZERO
+    remaining = tuple(value for value in values if value != _ONE)
+    if not remaining:
+        return _ONE
+    if len(remaining) == 1:
+        return remaining[0]
+    # Keep conjunction operands as immutable term sets rather than recursively
+    # nesting the complete expression tree.  This preserves exact inverse
+    # matching while keeping large predication circuits linear in gate count.
+    operands = (frozenset(value.terms for value in remaining),)
+    return _BoolExpression(frozenset({_BoolAtom("and", key=operands)}))
 
 
 def _read_member(value: Any, *names: str, default: Any = None) -> Any:
@@ -360,18 +406,21 @@ def _normalize_operations(circuit: Any) -> list[_Operation]:
         name = _operation_name(raw)
         canonical = _GATE_ALIASES.get(name)
         if canonical is None:
-            if name in {"mcx", "multi_controlled_x", "multi_x"}:
-                raise UnsupportedGateError(
-                    "MCX is not supported by the OpenQASM 3 primitive backend; "
-                    "decompose it to X/CX/CCX before emission"
-                )
             raise UnsupportedGateError(f"unsupported gate for OpenQASM 3: {name}")
         qubits = _operation_qubits(raw)
-        expected = {"x": 1, "cx": 2, "ccx": 3}[canonical]
-        if len(qubits) != expected:
-            raise QASM3Error(
-                f"gate {name!r} expects {expected} qubits, got {len(qubits)}"
-            )
+        if canonical == "mcx":
+            if len(qubits) < 2:
+                raise QASM3Error(
+                    f"gate {name!r} expects at least 2 qubits, got {len(qubits)}"
+                )
+        else:
+            expected = {"x": 1, "cx": 2, "ccx": 3}[canonical]
+            if len(qubits) != expected:
+                raise QASM3Error(
+                    f"gate {name!r} expects {expected} qubits, got {len(qubits)}"
+                )
+        if len(set(qubits)) != len(qubits):
+            raise QASM3Error(f"gate {name!r} cannot reuse a qubit: {qubits!r}")
         result.append(_Operation(canonical, qubits))
     return result
 
@@ -440,6 +489,85 @@ def _layout_qubit_map(layout: Any) -> dict[Any, tuple[str, int]]:
             if token is not None:
                 result[key] = token
     return result
+
+
+def _is_ancilla_register_name(name: str) -> bool:
+    normalized = name.lower().replace("-", "_")
+    return normalized.startswith(("ancilla", "workspace", "scratch")) or normalized in {
+        "work",
+        "temporary",
+        "temporaries",
+        "tmp",
+    }
+
+
+def _layout_register_items(layout: Any) -> list[tuple[str, Any]]:
+    """Return named register records without imposing a concrete layout type."""
+
+    items: list[tuple[str, Any]] = []
+    if isinstance(layout, Mapping):
+        items.extend(
+            (str(name), value)
+            for name, value in layout.items()
+            if isinstance(name, str)
+        )
+    for field_name in ("registers", "quantum_registers", "qregs", "qubit_registers"):
+        value = _layout_value(layout, field_name)
+        if isinstance(value, Mapping):
+            items.extend(
+                (str(name), item)
+                for name, item in value.items()
+                if isinstance(name, str)
+            )
+        elif isinstance(value, (Sequence, Iterable)) and not isinstance(
+            value, (str, bytes)
+        ):
+            for item in value:
+                if isinstance(item, (tuple, list)) and len(item) == 2:
+                    name, record = item
+                    if isinstance(name, str):
+                        items.append((name, record))
+                        continue
+                name = _read_member(item, "name", "register", default=None)
+                if isinstance(name, str):
+                    items.append((name, item))
+    return items
+
+
+def _layout_ancilla_bits(layout: Any) -> tuple[int, ...]:
+    """Find the physical bits explicitly or conventionally marked clean."""
+
+    if layout is None:
+        return ()
+    for field_name in (
+        "clean_ancillas",
+        "ancilla_bits",
+        "clean_workspace",
+        "workspace_bits",
+        "ancillas",
+    ):
+        bits = _bits_from_value(_layout_value(layout, field_name))
+        if bits:
+            return bits
+
+    register_items = _layout_register_items(layout)
+    for name, item in register_items:
+        if not _is_ancilla_register_name(name):
+            continue
+        bits = _bits_from_value(item)
+        if bits:
+            return bits
+
+        # A small structural fixture may describe registers only by width.  In
+        # that case integer wires are mapped over the ordered registers, so
+        # recover the same flat offsets used by _resolve_qubit.
+        registers = _layout_registers(layout)
+        offset = 0
+        for register in registers:
+            if register.name == name:
+                return tuple(range(offset, offset + register.size))
+            offset += register.size
+    return ()
 
 
 def _resolve_qubit(
@@ -540,6 +668,204 @@ def _normalized_registers(
     return registers, qubit_map
 
 
+def _resolve_operations(
+    operations: Sequence[_Operation],
+    layout: Any,
+    registers: Sequence[_Register],
+    qubit_map: Mapping[Any, tuple[str, int]],
+) -> list[_Operation]:
+    return [
+        _Operation(
+            operation.name,
+            tuple(
+                _resolve_qubit(value, layout, registers, qubit_map)
+                for value in operation.qubits
+            ),
+        )
+        for operation in operations
+    ]
+
+
+def _clean_mcx_operations(
+    controls: Sequence[Any], target: Any, ancillas: Sequence[Any]
+) -> tuple[_Operation, ...]:
+    """Build the clean-ancilla ladder for one multi-controlled X.
+
+    With ``k`` controls, the ladder computes successive control conjunctions
+    into ``k - 2`` clean work bits, toggles the target with one Toffoli, and
+    reverses the conjunctions.  It therefore emits ``2*k - 3`` CCX gates and
+    restores every work bit to its incoming value.  The caller owns the
+    contract that the supplied work bits are clean at this operation.
+    """
+
+    control_tuple = tuple(controls)
+    if len(control_tuple) == 1:
+        return (_Operation("cx", (control_tuple[0], target)),)
+    if len(control_tuple) == 2:
+        return (_Operation("ccx", (*control_tuple, target)),)
+
+    required = len(control_tuple) - 2
+    work = tuple(ancillas[:required])
+    if len(work) != required:
+        raise MCXDecompositionError(
+            f"MCX with {len(control_tuple)} controls requires {required} clean "
+            f"ancilla(s), but only {len(work)} were supplied"
+        )
+    operands = (*control_tuple, target, *work)
+    if len(set(operands)) != len(operands):
+        raise MCXDecompositionError(
+            "MCX decomposition requires clean ancillas distinct from controls "
+            "and target"
+        )
+
+    result: list[_Operation] = [
+        _Operation("ccx", (control_tuple[0], control_tuple[1], work[0]))
+    ]
+    for index in range(2, len(control_tuple) - 1):
+        result.append(
+            _Operation(
+                "ccx",
+                (work[index - 2], control_tuple[index], work[index - 1]),
+            )
+        )
+    result.append(_Operation("ccx", (work[-1], control_tuple[-1], target)))
+    result.extend(reversed(result[:-1]))
+    return tuple(result)
+
+
+def decompose_mcx(
+    controls: Sequence[Any], target: Any, ancillas: Sequence[Any]
+) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    """Return a clean-ancilla MCX decomposition as ``(name, qubits)`` pairs.
+
+    The returned network uses only X-free CX/CCX primitives.  One or two
+    controls naturally reduce to CX or CCX; larger gates require exactly
+    ``len(controls) - 2`` distinct clean ancillas.  The work bits are borrowed
+    only for the duration of this network and are restored before it returns.
+    """
+
+    control_tuple = tuple(controls)
+    if not control_tuple:
+        raise MCXDecompositionError("MCX requires at least one control")
+    if len(set(control_tuple)) != len(control_tuple):
+        raise MCXDecompositionError("MCX controls must be distinct")
+    if target in control_tuple:
+        raise MCXDecompositionError("MCX target overlaps a control")
+    result = _clean_mcx_operations(control_tuple, target, tuple(ancillas))
+    return tuple((operation.name, operation.qubits) for operation in result)
+
+
+def _layout_output_bits(layout: Any) -> tuple[int, ...]:
+    if layout is None:
+        return ()
+    output = _bits_from_value(_layout_value(layout, "output"))
+    if output:
+        return output
+    for name in ("outputs", "output_registers"):
+        value = _layout_value(layout, name)
+        if isinstance(value, Mapping):
+            for item in value.values():
+                output = _bits_from_value(item)
+                if output:
+                    return output
+    for name, item in _layout_register_items(layout):
+        if name.lower() in {"output", "result", "results"}:
+            output = _bits_from_value(item)
+            if output:
+                return output
+    return ()
+
+
+def _layout_zero_tokens(
+    layout: Any,
+    registers: Sequence[_Register],
+    qubit_map: Mapping[Any, tuple[str, int]],
+) -> tuple[tuple[str, int], ...]:
+    """Return layout wires guaranteed to start at zero.
+
+    qcc output and ancilla registers are zero-initialized by the circuit
+    contract.  Input registers are intentionally excluded; an output bit is
+    also a valid borrowed clean bit until the source circuit first touches it.
+    """
+
+    bits = (*_layout_ancilla_bits(layout), *_layout_output_bits(layout))
+    result: list[tuple[str, int]] = []
+    for bit in bits:
+        token = _resolve_qubit(bit, layout, registers, qubit_map)
+        if token not in result:
+            result.append(token)
+    return tuple(result)
+
+
+def _apply_known_operation(
+    known: dict[tuple[str, int], _BoolExpression], operation: _Operation
+) -> None:
+    """Propagate symbolic Boolean expressions through a source gate."""
+
+    target = operation.qubits[-1]
+    controls = operation.qubits[:-1]
+    target_expression = known[target]
+    if operation.name == "x":
+        known[target] = _xor_expression(target_expression, _ONE)
+    else:
+        known[target] = _xor_expression(
+            target_expression,
+            _and_expression(tuple(known[control] for control in controls)),
+        )
+
+
+def _decompose_operations(
+    operations: Sequence[_Operation], clean_tokens: Sequence[Any]
+) -> list[_Operation]:
+    """Expand MCX operations using clean wires proven zero at that point.
+
+    The proof is deliberately conservative: it tracks definite Boolean
+    constants through the source gate stream and never assumes that an input-
+    dependent wire is clean merely because it was touched by an inverse block.
+    A layout can opt into borrowed clean workspace by marking output or
+    ancilla wires as zero-initialized; those wires are restored by the ladder.
+    """
+
+    result: list[_Operation] = []
+    known: dict[tuple[str, int], _BoolExpression] = {}
+    for operation in operations:
+        for qubit in operation.qubits:
+            known.setdefault(
+                qubit,
+                _BoolExpression(frozenset({_BoolAtom("variable", key=(qubit,))})),
+            )
+    for token in clean_tokens:
+        known[token] = _ZERO
+
+    for operation_index, operation in enumerate(operations):
+        if operation.name != "mcx":
+            result.append(operation)
+            _apply_known_operation(known, operation)
+            continue
+
+        controls = operation.qubits[:-1]
+        target = operation.qubits[-1]
+        required = max(0, len(controls) - 2)
+        available = tuple(
+            token
+            for token in clean_tokens
+            if known[token] == _ZERO and token not in operation.qubits
+        )
+        if len(available) < required:
+            raise MCXDecompositionError(
+                f"cannot decompose MCX at operation {operation_index}: requires "
+                f"{required} clean ancilla(s) not touched earlier, but only "
+                f"{len(available)} are available; declare sufficient clean "
+                "workspace in the circuit layout"
+            )
+        result.extend(_clean_mcx_operations(controls, target, available))
+        # The generated ladder restores its work wires.  Advance the analysis
+        # by the source MCX only, because its target effect is the same as the
+        # decomposed primitive network.
+        _apply_known_operation(known, operation)
+    return result
+
+
 def emit_qasm3(circuit: Any, layout: Any | None = None, validate: bool = True) -> str:
     """Emit an OpenQASM 3 program for a primitive circuit.
 
@@ -557,6 +883,13 @@ def emit_qasm3(circuit: Any, layout: Any | None = None, validate: bool = True) -
         if isinstance(total_qubits, int) and total_qubits > 0:
             actual_layout = {"q": total_qubits}
     registers, qubit_map = _normalized_registers(actual_layout, operations)
+    resolved_operations = _resolve_operations(
+        operations, actual_layout, registers, qubit_map
+    )
+    operations = _decompose_operations(
+        resolved_operations,
+        _layout_zero_tokens(actual_layout, registers, qubit_map),
+    )
 
     lines = ["OPENQASM 3.0;", 'include "stdgates.inc";', ""]
     for register in registers:
@@ -646,6 +979,10 @@ def validate_qasm3(source: str, *, expected_layout: Any | None = None) -> bool:
             raise QASM3ValidationError(
                 f"line {line_number}: {name} expects {expected} qubit operands"
             )
+        if len(set(operands)) != len(operands):
+            raise QASM3ValidationError(
+                f"line {line_number}: {name} operands must be distinct"
+            )
         for operand in operands:
             reference = _QREF.fullmatch(operand)
             if not reference:
@@ -719,7 +1056,9 @@ __all__ = [
     "QASM3Backend",
     "QASM3Error",
     "QASM3ValidationError",
+    "MCXDecompositionError",
     "UnsupportedGateError",
+    "decompose_mcx",
     "emit",
     "emit_qasm3",
     "is_valid_qasm3",
