@@ -1,207 +1,111 @@
-"""Exhaustive v0.3 multiplication and constant-divmod coverage."""
+"""v0.3 arithmetic differential tests against native fixed-width C."""
 
 from __future__ import annotations
 
-from itertools import product
+import ctypes
+from functools import cache
+from pathlib import Path
 
 import pytest
 
-from qcc import CircuitBuilder
-from qcc.lib.divmod import constant_divmod, constant_divmod_workspace_width
-from qcc.lib.multiply import (
-    controlled_multiply_modular,
-    multiply_modular,
-    multiply_widening,
+import qcc
+from qcc.errors import CompilerError
+from v02_helpers import (
+    assert_inverse_restores,
+    assert_output_and_clean,
+    build_native_library,
+    native_function,
 )
-from qcc.lower.bennett import GateBuffer
-from qcc.sim.classical import read_register, simulate
+
+FIXTURE = Path(__file__).parent / "fixtures" / "v03_arithmetic.c"
+ZERO_DIVISOR_FIXTURE = Path(__file__).parent / "fixtures" / "v03_zero_divisor.c"
 
 
-def _registers(width: int, start: int = 0) -> tuple[tuple[int, ...], ...]:
-    return tuple(
-        tuple(range(start + offset * width, start + (offset + 1) * width))
-        for offset in range(4)
+@pytest.fixture(scope="module")
+def native_library(tmp_path_factory: pytest.TempPathFactory) -> ctypes.CDLL:
+    return build_native_library(FIXTURE, tmp_path_factory)
+
+
+@cache
+def _circuit(function: str) -> object:
+    return qcc.compile_c(FIXTURE, function=function)
+
+
+def test_multiply8_matches_native_for_every_16_bit_input(
+    native_library: ctypes.CDLL,
+) -> None:
+    native = native_function(
+        native_library,
+        "multiply8",
+        (ctypes.c_uint8, ctypes.c_uint8),
+        ctypes.c_uint16,
     )
+    circuit = _circuit("multiply8")
+
+    for left in range(256):
+        for right in range(256):
+            expected = left * right
+            assert int(native(left, right)) == expected
+            assert_output_and_clean(circuit, {"a": left, "b": right}, expected)
 
 
-def test_shift_and_add_multiplication_is_exhaustive_widths_one_through_six() -> None:
-    for width in range(1, 7):
-        multiplicand, multiplier, target, _ = _registers(width)
-        workspace = tuple(range(4 * width, 5 * width + 1))
-        builder = CircuitBuilder(5 * width + 1)
-        multiply_modular(
-            builder,
-            multiplicand,
-            multiplier,
-            target,
-            workspace,
-        )
-        circuit = builder.build()
-        mask = (1 << width) - 1
-        for left, right in product(range(1 << width), repeat=2):
-            state = left | (right << width)
-            result = simulate(circuit, state)
-            assert read_register(result, multiplicand) == left
-            assert read_register(result, multiplier) == right
-            assert read_register(result, target) == (left * right) & mask
-            assert all(((result >> qubit) & 1) == 0 for qubit in workspace)
-
-
-def test_widening_multiplication_is_exhaustive_widths_one_through_six() -> None:
-    for width in range(1, 7):
-        multiplicand = tuple(range(width))
-        multiplier = tuple(range(width, 2 * width))
-        target = tuple(range(2 * width, 4 * width))
-        workspace = tuple(range(4 * width, 6 * width + 1))
-        builder = CircuitBuilder(6 * width + 1)
-        multiply_widening(
-            builder,
-            multiplicand,
-            multiplier,
-            target,
-            workspace,
-        )
-        circuit = builder.build()
-        for left, right in product(range(1 << width), repeat=2):
-            state = left | (right << width)
-            result = simulate(circuit, state)
-            assert read_register(result, target) == left * right
-            assert all(((result >> qubit) & 1) == 0 for qubit in workspace)
-
-
-def test_controlled_multiplication_is_exhaustive_and_cleans_workspace() -> None:
-    for width in range(1, 7):
-        control = 0
-        multiplicand = tuple(range(1, width + 1))
-        multiplier = tuple(range(width + 1, 2 * width + 1))
-        target = tuple(range(2 * width + 1, 3 * width + 1))
-        workspace = tuple(range(3 * width + 1, 4 * width + 2))
-        builder = CircuitBuilder(4 * width + 2)
-        controlled_multiply_modular(
-            builder,
-            control,
-            multiplicand,
-            multiplier,
-            target,
-            workspace,
-        )
-        circuit = builder.build()
-        mask = (1 << width) - 1
-        for enabled, left, right in product(
-            range(2), range(1 << width), range(1 << width)
-        ):
-            state = enabled | (left << 1) | (right << (width + 1))
-            result = simulate(circuit, state)
-            expected = (left * right) & mask if enabled else 0
-            assert read_register(result, target) == expected
-            assert all(((result >> qubit) & 1) == 0 for qubit in workspace)
-
-
-def test_multiplication_accumulates_into_a_dirty_target() -> None:
-    for width in range(1, 5):
-        multiplicand, multiplier, target, _ = _registers(width)
-        workspace = tuple(range(4 * width, 5 * width + 1))
-        builder = CircuitBuilder(5 * width + 1)
-        multiply_modular(builder, multiplicand, multiplier, target, workspace)
-        circuit = builder.build()
-        mask = (1 << width) - 1
-        for left, right, old_target in product(
-            range(1 << width), range(1 << width), range(1 << width)
-        ):
-            state = left | (right << width) | (old_target << (2 * width))
-            result = simulate(circuit, state)
-            assert read_register(result, target) == (old_target + left * right) & mask
-            assert all(((result >> qubit) & 1) == 0 for qubit in workspace)
-
-
-def test_constant_divmod_is_exhaustive_for_widths_one_through_six() -> None:
-    for width in range(1, 7):
-        dividend = tuple(range(width))
-        quotient = tuple(range(width, 2 * width))
-        remainder = tuple(range(2 * width, 3 * width))
-        workspace_width = constant_divmod_workspace_width(width)
-        workspace = tuple(range(3 * width, 3 * width + workspace_width))
-        for divisor in range(1, (1 << width) + 2):
-            builder = CircuitBuilder(3 * width + workspace_width)
-            constant_divmod(
-                builder,
-                dividend,
-                divisor,
-                quotient,
-                remainder,
-                workspace,
-            )
-            circuit = builder.build()
-            for value in range(1 << width):
-                result = simulate(circuit, value)
-                assert read_register(result, dividend) == value
-                assert read_register(result, quotient) == value // divisor
-                assert read_register(result, remainder) == value % divisor
-                assert all(((result >> qubit) & 1) == 0 for qubit in workspace)
-
-
-def test_constant_divmod_xor_targets_and_divisor_policy() -> None:
-    for width in range(1, 5):
-        dividend = tuple(range(width))
-        quotient = tuple(range(width, 2 * width))
-        remainder = tuple(range(2 * width, 3 * width))
-        workspace_width = constant_divmod_workspace_width(width)
-        workspace = tuple(range(3 * width, 3 * width + workspace_width))
-        for divisor in range(1, (1 << width) + 2):
-            builder = CircuitBuilder(3 * width + workspace_width)
-            constant_divmod(
-                builder,
-                dividend,
-                divisor,
-                quotient,
-                remainder,
-                workspace,
-            )
-            circuit = builder.build()
-            for value, old_quotient, old_remainder in product(
-                range(1 << width), range(1 << width), range(1 << width)
-            ):
-                state = value | (old_quotient << width) | (old_remainder << (2 * width))
-                result = simulate(circuit, state)
-                assert read_register(result, quotient) == (
-                    old_quotient ^ (value // divisor)
-                )
-                assert read_register(result, remainder) == (
-                    old_remainder ^ (value % divisor)
-                )
-                assert all(((result >> qubit) & 1) == 0 for qubit in workspace)
-
-    width = 4
-    registers = _registers(width)
-    workspace = tuple(
-        range(4 * width, 4 * width + constant_divmod_workspace_width(width))
+@pytest.mark.parametrize(
+    ("function", "divisor", "remainder"),
+    (
+        ("udiv3_8", 3, False),
+        ("urem3_8", 3, True),
+        ("udiv5_8", 5, False),
+        ("urem5_8", 5, True),
+        ("udiv255_8", 255, False),
+        ("urem255_8", 255, True),
+    ),
+)
+def test_constant_udiv_and_urem_match_native_for_every_uint8_input(
+    native_library: ctypes.CDLL,
+    function: str,
+    divisor: int,
+    remainder: bool,
+) -> None:
+    native = native_function(
+        native_library,
+        function,
+        (ctypes.c_uint8,),
+        ctypes.c_uint8,
     )
-    for emitter in (CircuitBuilder(4 * width + len(workspace)), GateBuffer()):
-        with pytest.raises(ValueError, match="nonzero"):
-            constant_divmod(
-                emitter,
-                registers[0],
-                0,
-                registers[1],
-                registers[2],
-                workspace,
-            )
+    circuit = _circuit(function)
+
+    for value in range(256):
+        expected = value % divisor if remainder else value // divisor
+        assert int(native(value)) == expected
+        assert_output_and_clean(circuit, {"value": value}, expected)
 
 
-def test_gatebuffer_accepts_mcx_intermediates_for_controlled_multiply() -> None:
-    width = 3
-    source = tuple(range(width))
-    multiplier = tuple(range(width, 2 * width))
-    target = tuple(range(2 * width, 3 * width))
-    workspace = tuple(range(3 * width, 4 * width + 1))
-    buffer = GateBuffer()
-    returned = controlled_multiply_modular(
-        buffer,
-        4 * width + 1,
-        source,
-        multiplier,
-        target,
-        workspace,
-    )
-    assert returned is buffer
-    assert any(gate.name == "mcx" for gate in buffer.gates)
+@pytest.mark.parametrize("function", ("udiv_zero8", "urem_zero8"))
+def test_v03_zero_divisor_is_rejected_by_the_compiler(function: str) -> None:
+    """A zero divisor is a compile-time error, never a guessed circuit policy."""
+
+    with pytest.raises(CompilerError) as captured:
+        qcc.compile_c(ZERO_DIVISOR_FIXTURE, function=function)
+
+    message = captured.value.message.lower()
+    assert "zero" in message
+    assert "div" in message or "remainder" in message
+
+
+@pytest.mark.parametrize(
+    ("function", "inputs"),
+    (
+        ("multiply8", {"a": 0, "b": 255}),
+        ("multiply8", {"a": 127, "b": 128}),
+        ("multiply8", {"a": 255, "b": 255}),
+        ("udiv3_8", {"value": 0}),
+        ("udiv3_8", {"value": 255}),
+        ("urem5_8", {"value": 255}),
+        ("udiv255_8", {"value": 254}),
+    ),
+)
+def test_v03_arithmetic_circuits_inverse_restore_basis_states(
+    function: str,
+    inputs: dict[str, int],
+) -> None:
+    assert_inverse_restores(_circuit(function), inputs)
