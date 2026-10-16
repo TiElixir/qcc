@@ -1,8 +1,9 @@
 """A small, typed SSA model used by the qcc lowering stages.
 
-This module intentionally models only the values needed by the v0.1 frontend:
-fixed-width integers, straight-line instructions, one or more named functions,
-and basic blocks.  It does not attempt to be a complete LLVM object model.
+This module intentionally models only the values needed by the bounded integer
+frontend: fixed-width integers, named functions, basic blocks, and the small
+instruction set accepted by the textual LLVM parser.  It does not attempt to
+be a complete LLVM object model.
 """
 
 from __future__ import annotations
@@ -159,13 +160,39 @@ class MetadataAttachment:
 
 
 @dataclass(frozen=True, slots=True)
+class PhiIncoming:
+    """One value and predecessor label in an integer ``phi`` instruction."""
+
+    value: Operand
+    block: str
+    source_location: SourceLocation | None = None
+
+    def __post_init__(self) -> None:
+        normalized = self.block.removeprefix("%").removesuffix(":")
+        if not normalized:
+            raise ValueError("a phi incoming edge needs a non-empty block name")
+        object.__setattr__(self, "block", normalized)
+
+    @property
+    def location(self) -> SourceLocation | None:
+        return self.source_location
+
+
+# A descriptive alias for callers that use LLVM terminology rather than the
+# shorter class name.
+IncomingValue = PhiIncoming
+
+
+@dataclass(frozen=True, slots=True)
 class Instruction:
-    """A typed instruction in the supported straight-line SSA subset.
+    """A typed instruction in the supported integer SSA subset.
 
     ``type`` is the result type for value-producing operations and the return
     type for ``ret``.  For ``icmp`` it is ``i1`` and ``operand_type`` carries
-    the compared integer type.  The generic representation makes the lowering
-    API stable without requiring one class for each LLVM opcode.
+    the compared integer type.  ``targets`` stores branch destination labels,
+    while ``incoming`` stores the edges of a ``phi``.  The generic
+    representation keeps the lowering API stable without requiring one class
+    for each LLVM opcode.
     """
 
     opcode: str
@@ -178,6 +205,8 @@ class Instruction:
     source_location: SourceLocation | None = None
     attributes: tuple[str, ...] = ()
     metadata: tuple[MetadataAttachment, ...] = ()
+    targets: tuple[str, ...] = ()
+    incoming: tuple[PhiIncoming, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "opcode", self.opcode.lower())
@@ -185,6 +214,14 @@ class Instruction:
         object.__setattr__(self, "flags", tuple(self.flags))
         object.__setattr__(self, "attributes", tuple(self.attributes))
         object.__setattr__(self, "metadata", tuple(self.metadata))
+        object.__setattr__(
+            self,
+            "targets",
+            tuple(
+                target.removeprefix("%").removesuffix(":") for target in self.targets
+            ),
+        )
+        object.__setattr__(self, "incoming", tuple(self.incoming))
 
     @property
     def location(self) -> SourceLocation | None:
@@ -229,6 +266,56 @@ class Instruction:
         return self.operands[0] if self.operands else None
 
     @property
+    def condition(self) -> Operand | None:
+        """The condition operand of ``br`` or ``select``, when present."""
+
+        if self.opcode in {"br", "select"} and self.operands:
+            return self.operands[0]
+        return None
+
+    @property
+    def true_value(self) -> Operand:
+        """The selected true-arm value of a ``select`` instruction."""
+
+        if self.opcode != "select" or len(self.operands) < 2:
+            raise AttributeError(f"{self.opcode} has no true selected value")
+        return self.operands[1]
+
+    @property
+    def false_value(self) -> Operand:
+        """The selected false-arm value of a ``select`` instruction."""
+
+        if self.opcode != "select" or len(self.operands) < 3:
+            raise AttributeError(f"{self.opcode} has no false selected value")
+        return self.operands[2]
+
+    @property
+    def branch_targets(self) -> tuple[str, ...]:
+        """Destination labels of a ``br`` instruction."""
+
+        return self.targets if self.opcode == "br" else ()
+
+    @property
+    def target(self) -> str | None:
+        """The sole destination of an unconditional ``br``, when present."""
+
+        if self.opcode == "br" and len(self.targets) == 1:
+            return self.targets[0]
+        return None
+
+    @property
+    def incoming_values(self) -> tuple[Operand, ...]:
+        """Values carried by a ``phi`` instruction, in incoming-edge order."""
+
+        return tuple(edge.value for edge in self.incoming)
+
+    @property
+    def incoming_blocks(self) -> tuple[str, ...]:
+        """Predecessor labels carried by a ``phi`` instruction."""
+
+        return tuple(edge.block for edge in self.incoming)
+
+    @property
     def is_terminator(self) -> bool:
         return self.opcode in {"ret", "br", "switch", "unreachable"}
 
@@ -259,6 +346,44 @@ class Instruction:
             type_text = f"{self.operand_type} " if self.operand_type else ""
             operands = ", ".join(self._operand_text(item) for item in self.operands)
             body = f"icmp {flags}{predicate}{type_text}{operands}"
+        elif opcode == "select":
+            condition = (
+                self._operand_text(self.condition)
+                if self.condition is not None
+                else "<missing>"
+            )
+            true_value = (
+                self._operand_text(self.true_value)
+                if len(self.operands) > 1
+                else "<missing>"
+            )
+            false_value = (
+                self._operand_text(self.false_value)
+                if len(self.operands) > 2
+                else "<missing>"
+            )
+            value_type = f"{self.type} " if self.type is not None else ""
+            body = (
+                f"select i1 {condition}, {value_type}{true_value}, "
+                f"{value_type}{false_value}"
+            )
+        elif opcode == "phi":
+            value_type = f"{self.type} " if self.type is not None else ""
+            incoming = ", ".join(
+                f"[ {self._operand_text(edge.value)}, %{edge.block} ]"
+                for edge in self.incoming
+            )
+            body = f"phi {value_type}{incoming}"
+        elif opcode == "br":
+            if len(self.targets) == 1:
+                body = f"br label %{self.targets[0]}"
+            elif len(self.targets) == 2 and self.condition is not None:
+                body = (
+                    f"br i1 {self._operand_text(self.condition)}, "
+                    f"label %{self.targets[0]}, label %{self.targets[1]}"
+                )
+            else:
+                body = "br <malformed>"
         elif opcode == "ret":
             if not self.operands:
                 body = "ret void"
@@ -282,6 +407,10 @@ class Instruction:
             result += f", flags={self.flags!r}"
         if self.predicate is not None:
             result += f", predicate={self.predicate!r}"
+        if self.targets:
+            result += f", targets={self.targets!r}"
+        if self.incoming:
+            result += f", incoming={self.incoming!r}"
         if self.source_location is not None:
             result += f", source_location={self.source_location!r}"
         return result + ")"
@@ -292,12 +421,15 @@ class Instruction:
 BinaryInstruction = Instruction
 CastInstruction = Instruction
 ICmpInstruction = Instruction
+SelectInstruction = Instruction
+PhiInstruction = Instruction
+BranchInstruction = Instruction
 ReturnInstruction = Instruction
 
 
 @dataclass(frozen=True, slots=True)
 class BasicBlock:
-    """A named sequence of instructions."""
+    """A named sequence of instructions and its outgoing CFG labels."""
 
     name: str = "entry"
     instructions: tuple[Instruction, ...] = ()
@@ -322,6 +454,21 @@ class BasicBlock:
     def is_terminated(self) -> bool:
         return self.terminator is not None
 
+    @property
+    def successors(self) -> tuple[str, ...]:
+        """Names of blocks reached by this block's branch terminator."""
+
+        terminator = self.terminator
+        if terminator is None:
+            return ()
+        return terminator.branch_targets
+
+    @property
+    def successor_names(self) -> tuple[str, ...]:
+        """Alias for :attr:`successors` useful when disambiguating objects."""
+
+        return self.successors
+
     def __iter__(self) -> Iterator[Instruction]:
         return iter(self.instructions)
 
@@ -332,7 +479,11 @@ class BasicBlock:
 
 @dataclass(frozen=True, slots=True)
 class Function:
-    """An integer-typed SSA function and its basic blocks."""
+    """An integer-typed SSA function and its basic blocks.
+
+    CFG helpers return blocks in source order.  Their label-based counterparts
+    make it possible to inspect the graph without relying on object identity.
+    """
 
     name: str
     return_type: IRType
@@ -347,6 +498,11 @@ class Function:
         object.__setattr__(self, "parameters", tuple(self.parameters))
         object.__setattr__(self, "blocks", tuple(self.blocks))
         object.__setattr__(self, "attributes", tuple(self.attributes))
+        names: set[str] = set()
+        for block in self.blocks:
+            if block.name in names:
+                raise ValueError(f"duplicate basic block %{block.name}")
+            names.add(block.name)
 
     @property
     def location(self) -> SourceLocation | None:
@@ -365,6 +521,70 @@ class Function:
     @property
     def instructions(self) -> tuple[Instruction, ...]:
         return tuple(instruction for block in self.blocks for instruction in block)
+
+    def get_block(self, name: str | BasicBlock) -> BasicBlock:
+        """Return a block by object or by its ``%``-optional label."""
+
+        if isinstance(name, BasicBlock):
+            if name in self.blocks:
+                return name
+            raise KeyError(name.name)
+        normalized = name.removeprefix("%").removesuffix(":")
+        for block in self.blocks:
+            if block.name == normalized:
+                return block
+        raise KeyError(name)
+
+    def block(self, name: str | BasicBlock) -> BasicBlock:
+        """Short alias for :meth:`get_block`."""
+
+        return self.get_block(name)
+
+    def lookup_block(self, name: str) -> BasicBlock | None:
+        """Return a named block, or ``None`` when it is not in the function."""
+
+        try:
+            return self.get_block(name)
+        except KeyError:
+            return None
+
+    def successor_names(self, block: str | BasicBlock) -> tuple[str, ...]:
+        """Return outgoing CFG labels for ``block``."""
+
+        selected = self.get_block(block)
+        return selected.successors
+
+    def successors(self, block: str | BasicBlock) -> tuple[BasicBlock, ...]:
+        """Return outgoing CFG blocks for ``block`` in branch order."""
+
+        return tuple(self.get_block(name) for name in self.successor_names(block))
+
+    def predecessor_names(self, block: str | BasicBlock) -> tuple[str, ...]:
+        """Return incoming CFG labels for ``block`` in source order."""
+
+        selected = self.get_block(block)
+        return tuple(
+            candidate.name
+            for candidate in self.blocks
+            if selected.name in candidate.successors
+        )
+
+    def predecessors(self, block: str | BasicBlock) -> tuple[BasicBlock, ...]:
+        """Return incoming CFG blocks for ``block`` in source order."""
+
+        return tuple(self.get_block(name) for name in self.predecessor_names(block))
+
+    @property
+    def cfg_successors(self) -> dict[str, tuple[str, ...]]:
+        """A label-to-label view of the function's outgoing CFG edges."""
+
+        return {block.name: block.successors for block in self.blocks}
+
+    @property
+    def cfg_predecessors(self) -> dict[str, tuple[str, ...]]:
+        """A label-to-label view of the function's incoming CFG edges."""
+
+        return {block.name: self.predecessor_names(block) for block in self.blocks}
 
     def lookup(self, name: str) -> SSAValue | None:
         """Look up a parameter or instruction result by ``name``/``%name``."""
@@ -508,6 +728,7 @@ IRBasicBlock = BasicBlock
 __all__ = [
     "BasicBlock",
     "BinaryInstruction",
+    "BranchInstruction",
     "CastInstruction",
     "Constant",
     "Function",
@@ -525,10 +746,14 @@ __all__ = [
     "IntegerType",
     "LLVMIntType",
     "MetadataAttachment",
+    "IncomingValue",
     "Module",
     "Operand",
     "Parameter",
+    "PhiIncoming",
+    "PhiInstruction",
     "ReturnInstruction",
+    "SelectInstruction",
     "SSAValue",
     "VoidType",
 ]
