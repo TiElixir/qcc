@@ -15,28 +15,27 @@ X/CX/CCX networks, and can emit OpenQASM 3. The project is designed to make
 its boundaries and resource costs explicit rather than to behave like a
 general-purpose C compiler.
 
-## Status: v0.1 pre-release
+## Status: v0.2 specification in progress
 
-The v0.1 milestone is under active construction. This bootstrap establishes
-the package contract, design documentation, and development checks; the
-frontend, circuit representation, lowering pipeline, and command-line
-implementation land separately. Until those components are present, this
-checkout is not a runnable compiler.
+The v0.1 straight-line integer boundary is the current implementation limit.
+This checkout documents the v0.2 target—integer predicates, reversible
+predication, SSA `phi` merges, constant shifts/rotates, and fully unrolled
+constant-bound loops—but does not claim that those features are implemented
+or that the v0.2 acceptance checks have passed.
 
-The v0.1 target is intentionally narrow:
-
-- Python 3.10 or newer at runtime.
-- Clang is the only required C frontend; qcc does not parse C source itself.
-- Straight-line functions over fixed-width unsigned integers, primarily
-  `uint8_t`, with the operations listed in [the supported-C contract](docs/supported_c.md).
-- Deterministic fixed-width arithmetic with reversible compute-copy-uncompute
-  scheduling and an OpenQASM 3 output path.
-
-The `is_solution` example above is the motivating interface for the project,
-but equality predicates are scheduled for v0.2. v0.1 does not promise support
-for arbitrary C, pointers, memory, floating point, I/O, recursion, surviving
-control-flow cycles, or undefined-behavior inputs. Qiskit integration is
+Until the v0.2 implementation is complete, the practical supported subset is
+the v0.1 straight-line subset: defined fixed-width integer constants, arguments,
+add/subtract, bitwise operations, supported casts, and return, primarily with
+`uint8_t`. The v0.2 additions above are target behavior rather than current
+practical support. The deliberate limitations include no arbitrary C, pointers,
+memory, floating point, I/O, recursion, variable shifts, runtime loops,
+residual CFG cycles, or undefined-behavior inputs. Qiskit integration is
 optional and is not a runtime dependency.
+
+The `is_solution` example above remains the motivating interface for the
+project. It requires the equality predicate, which is specified for v0.2 but
+is not available in the current v0.1 implementation, so the snippet is a
+future-facing API sketch rather than a runnable quickstart.
 
 ## Development setup
 

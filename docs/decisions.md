@@ -96,3 +96,29 @@ will add that public package surface along with the implementation modules.
 The frontend, circuit, lowering, CLI, and tests are intentionally separate
 work items so their commits can be reviewed and merged without a placeholder
 API becoming a hidden contract.
+
+## D-008 — define phi values by incoming CFG edge
+
+**Status:** accepted
+
+A `phi` selects its incoming value from the concrete predecessor edge taken at
+block entry. Edge identity is preserved during CFG normalization, and missing,
+extra, or mismatched incoming edges are diagnostics rather than inferred
+values.
+
+## D-009 — reject cycles left after constant-bound unrolling
+
+**Status:** accepted
+
+A loop is accepted only after the frontend proves a constant bound and fully
+unrolls it. Any backedge or cycle remaining in the normalized reachable CFG is
+rejected; qcc never substitutes a runtime loop or an implicit iteration cap.
+
+## D-010 — interpret signed comparisons as two's-complement predicates
+
+**Status:** accepted
+
+Signed `icmp` predicates interpret each fixed-width operand as an `n`-bit
+two's-complement value. This signed comparison rule does not make
+signed-overflow arithmetic defined or expand support for general signed
+arithmetic.

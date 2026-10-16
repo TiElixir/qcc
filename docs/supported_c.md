@@ -1,72 +1,120 @@
 # Supported C subset
 
-This document is the source-level contract for qcc v0.1. It describes the
-constructs that may be lowered after Clang emits textual LLVM IR. A program
-that uses a construct outside this list must be rejected with a diagnostic;
-qcc must not silently compile a weaker interpretation.
+This document is the authoritative source-level contract for qcc v0.2. It
+covers the constructs that may be lowered after Clang emits normalized textual
+LLVM IR. The v0.2 contract is deliberately narrower than C: a construct is
+supported only when its generated IR satisfies the value, CFG, and cleanup
+rules below. A v0.2 design entry is not by itself a claim that the current
+checkout has finished implementing that construct.
 
-## Supported in v0.1
+## Supported in v0.2
 
-### Function shape
+### Function and value model
 
-- A function with integer arguments and an integer return value.
-- A single straight-line basic block ending in `return`.
+- A pure function with fixed-width scalar integer arguments and one fixed-width
+  integer return value. `uint8_t` remains the primary public example; other
+  explicit widths are accepted when the IR and resource limits support them.
+- Fixed-width signed integer values for defined comparisons. Signed predicates
+  interpret their operands as two's-complement bit patterns. General signed
+  arithmetic that can overflow is not made defined by qcc.
 - No observable side effects: the function may not read or write global state,
-  perform I/O, or call another function.
-- Fixed-width unsigned integer types, with `uint8_t` as the primary supported
-  public type. Widths are explicit in the generated IR.
+  perform I/O, access memory, or call another function.
+- Defined source behavior only. C undefined behavior, poison, and `undef`
+  values are rejected rather than assigned reversible semantics.
 
-### Expressions
+### Integer expressions
 
-The v0.1 lowering contract covers the following operations when their integer
-widths and operands are valid:
+The v0.2 lowering contract covers these operations when widths and operands are
+valid:
 
 - Integer constants and function arguments.
-- Addition and subtraction (`+`, `-`).
-- Bitwise AND, OR, and XOR (`&`, `|`, `^`).
-- Bitwise complement (`~`) when represented by the equivalent supported LLVM
-  pattern.
-- Zero extension and truncation between supported integer widths.
+- Addition and subtraction (`+`, `-`) with the documented fixed-width modulo
+  behavior for accepted IR.
+- Bitwise AND, OR, XOR, and complement (`&`, `|`, `^`, `~`) including the
+  canonical LLVM representation of complement.
+- Zero extension, sign extension, and truncation (`zext`, `sext`, `trunc`) with
+  the declared source and destination widths.
+- Equality, inequality, and ordered comparisons. All LLVM integer `icmp`
+  predicates are supported: `eq`, `ne`, `ugt`, `uge`, `ult`, `ule`, `sgt`,
+  `sge`, `slt`, and `sle`.
+- Conditional expressions and LLVM `select` when the condition is `i1` and
+  both arms have the same integer type.
+- Constant-count shifts. Unsigned left/right shifts are supported when the
+  count is a compile-time value in `0 <= count < width`. A signed right shift
+  is accepted only when the frontend supplies the documented two's-complement
+  `ashr` semantics.
+- Constant-count rotates represented by a recognized fixed-width rotate idiom
+  or frontend operation. The count is reduced modulo the operand width; a
+  variable rotate is not supported.
 - Returning a supported integer value.
 
-Operations are evaluated modulo the result width. The compiler's fixed-width
-semantics apply only to defined source programs; C undefined behavior is not
-made reversible or portable by qcc.
+### Control flow and SSA
 
-A representative v0.1-shaped function is:
+- A single entry block and a finite, reachable CFG made from unconditional and
+  conditional branches and integer returns. Nested `if`/`else` regions are
+  supported after normalization.
+- `phi` nodes at the beginning of a merge block. Each reachable predecessor
+  edge has exactly one same-width incoming value, and the incoming value is
+  selected by the edge that actually reached the block.
+- The frontend may fully unroll a source loop with a compile-time iteration
+  bound. The resulting CFG may retain conditional exits, but it must contain
+  no backedge or cycle before lowering.
+- A source conditional expression may lower to `select` instead of a branch;
+  both forms use the same reversible predicate and mux semantics.
 
-```c
-#include <stdint.h>
+## Unsupported in v0.2
 
-uint8_t mix(uint8_t x, uint8_t y) {
-    return (uint8_t)((x ^ y) + 3u);
-}
-```
+The following constructs are outside the authoritative v0.2 contract and must
+be rejected:
 
-## Rejected in v0.1
+- Runtime, data-dependent, or partially unrolled loops; any CFG cycle,
+  backedge, self-loop, or residual strongly connected component.
+- `switch`, indirect branches, computed `goto`, exception edges, and other
+  terminators that are not normalized to the supported branch CFG.
+- Variable shifts and rotates, shift counts outside the operand width, and
+  source signed-right-shift forms whose result depends on implementation-
+  defined C behavior.
+- Multiplication, division, remainder, floating-point arithmetic, vectors,
+  atomics, and compiler extensions that change the fixed-width contract.
+- Pointers, arrays, structs, unions, `volatile` access, loads, stores, address
+  calculations, dynamic allocation, and global state.
+- Function calls, recursion, function pointers, inline assembly, I/O, and
+  other observable side effects.
+- Signed arithmetic whose C result can depend on overflow. Signed comparisons
+  are supported as specified above; that exception does not make signed
+  addition, subtraction, or other arithmetic generally portable.
+- Multiple return values or return types, void-producing public functions,
+  malformed SSA, or a phi with a missing or ambiguously duplicated edge value.
+  Operands with mismatched or inferred widths are also rejected.
 
-The following are outside the first release, even when Clang can lower them
-to LLVM IR:
+Clang may lower a source construct into a different LLVM shape. The normalized
+LLVM IR is the validator's source of truth: qcc accepts a source program only
+when that shape is in the supported list, and it never skips an unrecognized
+instruction because the original C looked harmless. The current v0.1
+straight-line implementation remains the practical boundary until the v0.2
+items are implemented and their acceptance checks are recorded.
 
-- Equality or ordered comparisons, `if`, `switch`, conditional expressions,
-  `select`, and `phi` nodes.
-- Loops or any cyclic control-flow graph.
-- Multiplication, division, remainder, variable shifts, and rotates.
-- Pointers, arrays, structs, unions, volatile access, loads, stores, and
-  dynamic allocation.
-- Function calls, recursion, inline assembly, atomics, and observable I/O.
-- Floating-point types, signed arithmetic whose behavior depends on overflow,
-  and vector types.
-- Pragmas or compiler extensions that change the fixed-width contract.
+## Diagnostic policy
 
-Comparisons, predication, and bounded acyclic control flow are planned for
-v0.2. Arithmetic growth and host integration are later milestones; see
-[plan.md](plan.md).
+Unsupported behavior is a hard error, never a warning followed by a weaker
+circuit. Diagnostics follow these rules:
 
-## Frontend expectations
+1. Report the source file, line, and column when Clang or the IR parser provides
+   them. Otherwise include the function, basic block, instruction, or CFG edge
+   that established the error.
+2. Name the rejected source or LLVM construct and state the violated rule. For
+   example, a residual backedge must say that full constant-bound unrolling is
+   required; a variable shift must say that only constant wiring is supported.
+3. Validate at each boundary. Clang failures, malformed textual LLVM, invalid
+   types, unsupported opcodes, malformed phi edge sets, and residual CFG cycles
+   must not be silently normalized into a different program.
+4. Reject undefined, poison, and `undef` behavior. qcc's modulo arithmetic and
+   two's-complement comparison rules apply only after the source program has
+   supplied defined values and operations.
+5. Keep diagnostics deterministic and source-aware enough for callers to fix
+   the program. A missing location is not a reason to accept an unsupported
+   construct.
 
-qcc relies on Clang to produce textual LLVM IR and may select optimization
-flags that canonicalize equivalent C expressions. The accepted IR is the
-source of truth for the validator, so a construct is supported only when its
-optimized representation is also in the accepted operation set. Clang is a
-required tool for integration use and is installed in CI.
+A diagnostic may include the function name and the normalized block/edge path,
+but it must not claim that an operation was lowered or tested when validation
+stopped before lowering.
