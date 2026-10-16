@@ -303,7 +303,7 @@ def test_existing_anonymous_netlist_circuit_is_an_accepted_api_input() -> None:
 
 @dataclass(frozen=True)
 class _UnsupportedFixture:
-    opcode: str = "mul"
+    opcode: str = "sdiv"
 
 
 def test_unsupported_ssa_operation_is_not_silently_approximated() -> None:

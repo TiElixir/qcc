@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from qcc.errors import UnsupportedConstructError
+from qcc.lib.divmod import constant_divmod, constant_divmod_workspace_width
+from qcc.lib.multiply import multiply_by_constant_modular, multiply_modular
 
 from .ancilla import AncillaAllocator, CircuitLayout, Register
 from .bennett import (
@@ -146,6 +148,9 @@ _ROTATE_OPS = {
 _SUPPORTED = {
     "add",
     "sub",
+    "mul",
+    "udiv",
+    "urem",
     "and",
     "or",
     "xor",
@@ -488,6 +493,9 @@ def _parse_operation(raw: Any) -> _Operation:
                 in {
                     "add",
                     "sub",
+                    "mul",
+                    "udiv",
+                    "urem",
                     "and",
                     "or",
                     "xor",
@@ -923,7 +931,9 @@ class _Lowerer:
                 f"{first.width}, {second.width}, and result {width}"
             )
         target = self._allocate_result(operation, width)
-        if operation.opcode == "add":
+        if operation.opcode == "mul":
+            self._emit_multiply(first, second, target)
+        elif operation.opcode == "add":
             add_registers(
                 self.scheduler,
                 first.register,
@@ -953,6 +963,119 @@ class _Lowerer:
                 self._emit_not(first, target)
             else:
                 self._emit_xor(first, second, target)
+
+    def _emit_multiply(self, first: _Value, second: _Value, target: _Value) -> None:
+        """Lower fixed-width multiplication with constant specialization."""
+
+        if first.constant is not None and second.constant is not None:
+            self._set_constant(target, first.constant * second.constant)
+            return
+        if first.constant is not None or second.constant is not None:
+            constant, dynamic = (
+                (first, second) if first.constant is not None else (second, first)
+            )
+            assert constant.constant is not None
+            workspace = None
+            if (constant.constant & self._mask(target.width)) not in {0, 1}:
+                workspace = self.allocator.allocate_ancilla(
+                    target.width + 1, self._fresh_label(f"{target.name}.mul-constant")
+                )
+            multiply_by_constant_modular(
+                self.scheduler,
+                dynamic.register.bits,
+                constant.constant,
+                target.register.bits,
+                None if workspace is None else workspace.bits,
+            )
+            return
+
+        multiplier = second
+        copied: Register | None = None
+        if set(first.register.bits) & set(second.register.bits):
+            copied = self.allocator.allocate_ancilla(
+                second.width, self._fresh_label(f"{target.name}.mul-copy")
+            )
+            copy_bits(self.scheduler, second.register.bits, copied.bits)
+            multiplier = _Value(
+                self._fresh_label(f"{target.name}.mul-factor"),
+                second.width,
+                copied,
+            )
+        workspace = self.allocator.allocate_ancilla(
+            target.width + 1, self._fresh_label(f"{target.name}.mul")
+        )
+        multiply_modular(
+            self.scheduler,
+            first.register.bits,
+            multiplier.register.bits,
+            target.register.bits,
+            workspace=workspace.bits,
+        )
+        if copied is not None:
+            copy_bits(self.scheduler, second.register.bits, copied.bits)
+
+    def _emit_constant_divmod(self, operation: _Operation) -> None:
+        """Lower unsigned division/remainder with a compile-time divisor."""
+
+        if len(operation.operands) != 2:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} expects two operands, "
+                f"got {len(operation.operands)}"
+            )
+        width_hint = _width_of(operation.width_spec)
+        dividend = self._resolve(operation.operands[0], width_hint)
+        divisor = self._resolve(operation.operands[1], width_hint or dividend.width)
+        width = width_hint or dividend.width
+        if dividend.width != width or divisor.width != width:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} has mismatched widths "
+                f"{dividend.width}, {divisor.width}, and result {width}"
+            )
+        if divisor.constant is None:
+            raise UnsupportedSSAOperation(
+                f"{self._error_context(operation)} requires a nonzero "
+                "compile-time constant divisor; general unsigned division "
+                "is unsupported"
+            )
+        divisor_value = divisor.constant & self._mask(width)
+        if divisor_value == 0:
+            raise UnsupportedSSAOperation(
+                f"{self._error_context(operation)} has a zero divisor; "
+                "unsigned division by zero is unsupported"
+            )
+        target = self._allocate_result(operation, width)
+        if dividend.constant is not None:
+            value = (
+                dividend.constant // divisor_value
+                if operation.opcode == "udiv"
+                else dividend.constant % divisor_value
+            )
+            self._set_constant(target, value)
+            return
+
+        quotient = self.allocator.allocate_ancilla(
+            width, self._fresh_label(f"{target.name}.div-quotient")
+        )
+        remainder = self.allocator.allocate_ancilla(
+            width, self._fresh_label(f"{target.name}.div-remainder")
+        )
+        workspace = self.allocator.allocate_ancilla(
+            constant_divmod_workspace_width(width),
+            self._fresh_label(f"{target.name}.div-work"),
+        )
+        start = self.scheduler.mark()
+        constant_divmod(
+            self.scheduler,
+            dividend.register.bits,
+            divisor_value,
+            quotient.bits,
+            remainder.bits,
+            workspace=workspace.bits,
+        )
+        computation = self.scheduler.block(start)
+        source = quotient if operation.opcode == "udiv" else remainder
+        copy_bits(self.scheduler, source.bits, target.register.bits)
+        self.scheduler.extend(reversed(computation))
 
     def _emit_not(self, source: _Value, target: _Value) -> None:
         if source.constant is not None:
@@ -1426,7 +1549,7 @@ class _Lowerer:
         """Resolve literals before predication captures the operation gates."""
 
         opcode = operation.opcode
-        if opcode in {"add", "sub", "and", "or", "xor", "icmp"}:
+        if opcode in {"add", "sub", "mul", "udiv", "urem", "and", "or", "xor", "icmp"}:
             width_hint = (
                 _comparison_width(operation)
                 if opcode == "icmp"
@@ -1497,8 +1620,16 @@ class _Lowerer:
             )
             target = self._allocate_result(operation, source.width)
             copy_bits(self.scheduler, source.register.bits, target.register.bits)
-        elif opcode in {"add", "sub", "and", "or", "xor"}:
+        elif opcode in {"add", "sub", "mul", "and", "or", "xor"}:
             self._emit_binary(operation)
+        elif opcode in {"udiv", "urem"}:
+            self._emit_constant_divmod(operation)
+        elif opcode in {"sdiv", "srem"}:
+            raise UnsupportedSSAOperation(
+                f"{self._error_context(operation)} signed division or remainder are "
+                "unsupported; only unsigned constant-divisor "
+                "operations are supported"
+            )
         elif opcode == "icmp":
             self._emit_icmp(operation)
         elif opcode == "select":
@@ -1509,7 +1640,7 @@ class _Lowerer:
             supported = ", ".join(sorted(_SUPPORTED - _TERMINATORS - {"phi"}))
             raise UnsupportedSSAOperation(
                 f"unsupported {self._error_context(operation)}; "
-                f"v0.2 supports {supported}"
+                f"v0.3 supports {supported}"
             )
 
     def _emit_predicated(self, operation: _Operation, guard: _Guard) -> None:
@@ -1787,11 +1918,17 @@ class _Lowerer:
                     self._emit_phi(operation, block_name, edge_guards)
                 elif operation.opcode in _SUPPORTED - _TERMINATORS:
                     self._emit_predicated(operation, guard)
+                elif operation.opcode in {"sdiv", "srem"}:
+                    raise UnsupportedSSAOperation(
+                        f"{self._error_context(operation)} signed division or "
+                        "remainder are unsupported; only unsigned constant-divisor "
+                        "operations are supported"
+                    )
                 else:
                     supported = ", ".join(sorted(_SUPPORTED - _TERMINATORS))
                     raise UnsupportedSSAOperation(
                         f"unsupported {self._error_context(operation)}; "
-                        f"v0.2 supports {supported}"
+                        f"v0.3 supports {supported}"
                     )
 
             if terminator is None:

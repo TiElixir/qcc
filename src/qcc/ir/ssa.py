@@ -327,7 +327,7 @@ class Instruction:
     def __str__(self) -> str:
         prefix = f"{self.result} = " if self.result is not None else ""
         opcode = self.opcode
-        if opcode in {"add", "sub", "and", "or", "xor"}:
+        if opcode in {"add", "sub", "mul", "udiv", "urem", "and", "or", "xor"}:
             flags = (" ".join(self.flags) + " ") if self.flags else ""
             type_text = f"{self.type} " if self.type is not None else ""
             operands = ", ".join(self._operand_text(item) for item in self.operands)
