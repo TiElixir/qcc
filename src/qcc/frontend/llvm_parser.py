@@ -62,7 +62,9 @@ _FLOAT_WORD_RE = re.compile(
 )
 _VECTOR_RE = re.compile(r"<\s*[0-9]+\s*x\s*[^>]+>")
 
-_BINARY_OPS = frozenset({"add", "sub", "and", "or", "xor", "shl", "lshr", "ashr"})
+_BINARY_OPS = frozenset(
+    {"add", "sub", "mul", "and", "or", "xor", "shl", "lshr", "ashr", "udiv", "urem"}
+)
 _CAST_OPS = frozenset({"zext", "sext", "trunc"})
 _ICMP_PREDICATES = frozenset(
     {"eq", "ne", "ugt", "uge", "ult", "ule", "sgt", "sge", "slt", "sle"}
@@ -85,10 +87,7 @@ _MEMORY_OPS = frozenset(
 )
 _UNSUPPORTED_OPS = frozenset(
     {
-        "mul",
-        "udiv",
         "sdiv",
-        "urem",
         "srem",
         "extractvalue",
         "insertvalue",
@@ -607,7 +606,13 @@ def _result(
 
 
 def _unsupported_opcode(opcode: str, location: SourceLocation) -> None:
-    if opcode == "call" or opcode.endswith("call") or opcode in {"invoke", "callbr"}:
+    if opcode in {"sdiv", "srem"}:
+        message = (
+            f"unsupported LLVM instruction {opcode!r}; signed division and "
+            "remainder are unsupported in v0.3; use unsigned operations with "
+            "a documented constant divisor"
+        )
+    elif opcode == "call" or opcode.endswith("call") or opcode in {"invoke", "callbr"}:
         message = (
             f"unsupported LLVM instruction {opcode!r}; function calls are not "
             "supported in the integer v0.2 frontend"
