@@ -1,5 +1,27 @@
 # Architecture decisions
 
+## D-004 — integrate the five v0.1 subsystem implementations directly
+
+- **Decision:** Keep the independently implemented frontend, netlist, lowering,
+  and backend APIs as small adapters around one canonical `qcc.ir.netlist`
+  representation, resolving name collisions in the public package rather than
+  duplicating circuit implementations.
+- **Alternatives:** Rewrite every subsystem into one monolithic implementation;
+  retain the lowering branch's fallback-only circuit model.
+- **Reason:** The canonical netlist already validates domains, layouts, gate
+  operands, inversion, and resources. Adapters preserve those checks and keep
+  the pipeline testable without making the frontend depend on backend details.
+
+## D-005 — Clang textual LLVM is the v0.1 compiler boundary
+
+- **Decision:** `qcc.compile_c` invokes the Clang wrapper, parses its textual
+  LLVM result, and then selects and lowers the requested function.
+- **Alternatives:** Parse C directly; call Clang through an LLVM Python binding;
+  make callers provide LLVM IR.
+- **Reason:** This satisfies the source-level API without introducing a C parser
+  or a runtime LLVM dependency, while keeping the supported LLVM subset small
+  and explicitly diagnosable.
+
 This record captures the decisions that define the bootstrap and v0.1
 boundary. The implementation plan in [plan.md](plan.md) is the source for the
 milestones referenced below.
