@@ -271,11 +271,19 @@ def _construct_circuit(lowered: LoweredCircuit) -> Any:
 
 
 def _looks_like_circuit(value: Any) -> bool:
-    return (
-        value is not None
-        and _attribute(value, ("gates", "operations", "ops"), None) is not None
-        and _attribute(value, ("layout",), None) is not None
+    if value is None:
+        return False
+    gates = _attribute(value, ("gates", "operations", "ops"), None)
+    if gates is None:
+        return False
+    # Existing netlists are valid compiler inputs even when they intentionally
+    # omit named registers (for example, an anonymous circuit fragment).
+    has_layout = _attribute(value, ("layout",), None) is not None
+    has_width = (
+        _attribute(value, ("num_qubits", "qubit_count", "n_qubits", "width"), None)
+        is not None
     )
+    return has_layout or has_width
 
 
 def _function_name(value: Any) -> str | None:

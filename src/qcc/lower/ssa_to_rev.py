@@ -1,4 +1,4 @@
-"""Lower straight-line integer SSA into a Bennett-clean reversible circuit.
+"""Lower fixed-width integer SSA into Bennett-clean reversible circuits.
 
 The frontend deliberately owns parsing C and LLVM.  This module only relies on
 small structural conventions (``args``, ``instructions``, ``opcode``, and
@@ -13,6 +13,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from qcc.errors import UnsupportedConstructError
+
 from .ancilla import AncillaAllocator, CircuitLayout, Register
 from .bennett import (
     BennettScheduler,
@@ -22,6 +24,7 @@ from .bennett import (
     copy_bits,
     or_bits,
     sub_registers,
+    sub_with_borrow,
     xor_bits,
 )
 
@@ -35,7 +38,7 @@ class SSAFormatError(LoweringError):
 
 
 class UnsupportedSSAOperation(LoweringError):
-    """Raised when v0.1 cannot lower an SSA opcode."""
+    """Raised when the lowering boundary cannot support an SSA operation."""
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,27 @@ class _Operation:
     operands: tuple[Any, ...]
     width_spec: Any = None
     source_width_spec: Any = None
+    predicate: str | None = None
+    direction: str | None = None
     source: Any = None
+
+
+@dataclass(frozen=True)
+class _Block:
+    name: str
+    operations: tuple[_Operation, ...]
+
+
+@dataclass(frozen=True)
+class _Guard:
+    """A path predicate represented by a clean bit or a compile-time bool."""
+
+    bit: int | None = None
+    constant: bool | None = None
+
+    def __post_init__(self) -> None:
+        if (self.bit is None) == (self.constant is None):
+            raise ValueError("a path guard must be a bit or a boolean constant")
 
 
 @dataclass(frozen=True)
@@ -96,6 +119,31 @@ _MISSING = object()
 _INT_RE = re.compile(r"^[+-]?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|[0-9]+)$")
 _WIDTH_RE = re.compile(r"(?:^|[^A-Za-z])(?:i|u|uint|int)([0-9]+)(?:$|[^0-9])")
 
+_ICMP_PREDICATES = {
+    "eq",
+    "ne",
+    "ugt",
+    "uge",
+    "ult",
+    "ule",
+    "sgt",
+    "sge",
+    "slt",
+    "sle",
+}
+_TERMINATORS = {"ret", "return", "br", "switch", "unreachable"}
+_SHIFT_OPS = {"shl", "lshr", "ashr"}
+_ROTATE_OPS = {
+    "rol",
+    "ror",
+    "rotl",
+    "rotr",
+    "rotate_left",
+    "rotate_right",
+    "fshl",
+    "fshr",
+    "rotate",
+}
 _SUPPORTED = {
     "add",
     "sub",
@@ -112,8 +160,12 @@ _SUPPORTED = {
     "copy",
     "mov",
     "identity",
-    "ret",
-    "return",
+    "icmp",
+    "select",
+    "phi",
+    *_SHIFT_OPS,
+    *_ROTATE_OPS,
+    *_TERMINATORS,
 }
 
 
@@ -255,6 +307,11 @@ def _normalise_opcode(value: Any) -> str:
     text = text.removeprefix("llvm.")
     text = text.replace("bitwise_", "")
     text = text.removesuffix(".void").removesuffix("_")
+    if text.startswith(("icmp.", "icmp_")):
+        return "icmp"
+    for base in _SHIFT_OPS | _ROTATE_OPS:
+        if text.startswith(f"{base}."):
+            return base
     return text
 
 
@@ -312,29 +369,68 @@ def _flatten_block(block: Any) -> list[Any]:
     return list(instructions)
 
 
-def _extract_instructions(function: Any) -> list[Any]:
-    raw = _field(function, ("instructions", "ops", "operations"), _MISSING)
-    if raw is not _MISSING and raw is not None:
-        if isinstance(raw, Mapping):
-            return list(raw.values())
-        return list(raw)
-    blocks = _field(function, ("blocks", "basic_blocks"), _MISSING)
-    if blocks is not _MISSING and blocks is not None:
-        if isinstance(blocks, Mapping):
-            blocks = tuple(blocks.values())
-        blocks = tuple(blocks)
-        if len(blocks) != 1:
-            raise UnsupportedSSAOperation(
-                "v0.1 lowering accepts one straight-line basic block; "
-                f"got {len(blocks)} blocks"
-            )
-        return _flatten_block(blocks[0])
-    body = _field(function, ("body",), _MISSING)
-    if body is not _MISSING and body is not None:
-        return _flatten_block(body)
-    if isinstance(function, (tuple, list)):
-        return list(function)
-    return []
+def _block_name(raw: Any, fallback: str) -> str:
+    if isinstance(raw, (tuple, list)) and raw:
+        if len(raw) >= 2 and str(raw[0]).lower() == "label":
+            raw = raw[-1]
+        elif len(raw) == 1:
+            raw = raw[0]
+    candidate = _field(raw, ("name", "label", "identifier", "id"), _MISSING)
+    if candidate is _MISSING:
+        candidate = raw if isinstance(raw, str) else fallback
+    text = str(candidate).strip()
+    if text.lower().startswith("label "):
+        text = text.split(None, 1)[1]
+    normalized = _normalise_name(text.rstrip(":"))
+    return normalized or fallback
+
+
+def _extract_blocks(function: Any) -> tuple[_Block, ...]:
+    """Extract named blocks while retaining the frontend's structural shape."""
+
+    raw_blocks = _field(function, ("blocks", "basic_blocks"), _MISSING)
+    block_items: list[tuple[str | None, Any]] = []
+    if raw_blocks is not _MISSING and raw_blocks is not None:
+        if isinstance(raw_blocks, Mapping):
+            block_items.extend((str(name), block) for name, block in raw_blocks.items())
+        else:
+            try:
+                block_items.extend((None, block) for block in tuple(raw_blocks))
+            except TypeError as exc:
+                raise SSAFormatError("function blocks are not iterable") from exc
+
+    if not block_items:
+        raw = _field(function, ("instructions", "ops", "operations"), _MISSING)
+        if raw is _MISSING or raw is None:
+            raw = _field(function, ("body",), _MISSING)
+        if raw is _MISSING or raw is None:
+            raw = function if isinstance(function, (tuple, list)) else ()
+        block_items = [("entry", raw)]
+
+    blocks: list[_Block] = []
+    used_names: set[str] = set()
+    for index, (mapping_name, raw_block) in enumerate(block_items):
+        fallback = mapping_name or ("entry" if index == 0 else f"block{index}")
+        name = _block_name(raw_block, fallback)
+        if (
+            mapping_name is not None
+            and _field(raw_block, ("name", "label", "identifier", "id"), _MISSING)
+            is _MISSING
+        ):
+            name = _block_name(mapping_name, fallback)
+        if name in used_names:
+            raise SSAFormatError(f"duplicate basic block {name!r}")
+        used_names.add(name)
+        operations = tuple(_parse_operation(raw) for raw in _flatten_block(raw_block))
+        blocks.append(_Block(name, operations))
+    return tuple(blocks)
+
+
+def _opcode_candidate(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return bool(text) and not text.startswith(("%", "@"))
 
 
 def _parse_operation(raw: Any) -> _Operation:
@@ -345,32 +441,79 @@ def _parse_operation(raw: Any) -> _Operation:
         opcode_index = next(
             (
                 index
-                for index, item in enumerate(values[:3])
+                for index, item in enumerate(values[:4])
                 if isinstance(item, str) and _normalise_opcode(item) in _SUPPORTED
             ),
             None,
         )
         if opcode_index is None:
-            raise SSAFormatError(f"cannot identify opcode in instruction {raw!r}")
-        opcode = _normalise_opcode(values[opcode_index])
+            candidates = [
+                index
+                for index, item in enumerate(values[:2])
+                if _opcode_candidate(item)
+            ]
+            if not candidates:
+                raise SSAFormatError(f"cannot identify opcode in instruction {raw!r}")
+            opcode_index = candidates[0]
+        raw_opcode = str(values[opcode_index])
+        raw_opcode_lower = raw_opcode.strip().lower()
+        opcode = _normalise_opcode(raw_opcode)
+        predicate = None
+        if raw_opcode_lower.startswith(("icmp.", "icmp_")):
+            predicate = raw_opcode_lower.split(".", 1)[-1].split("_", 1)[-1]
         before = values[:opcode_index]
         result = _normalise_name(before[-1]) if before else None
-        operands = tuple(values[opcode_index + 1 :])
-        width_spec = None
-        if opcode in {"zext", "sext", "trunc"} and len(operands) >= 2:
-            width_spec = operands[-1]
-            operands = operands[:-1]
-        elif opcode in {"add", "sub", "and", "or", "xor"} and len(operands) >= 3:
+        operand_values = list(values[opcode_index + 1 :])
+        width_spec: Any = None
+        source_width_spec: Any = None
+        if opcode == "icmp":
+            if operand_values and isinstance(operand_values[0], str):
+                candidate = operand_values[0].strip().lower()
+                if candidate in _ICMP_PREDICATES:
+                    predicate = candidate
+                    operand_values.pop(0)
+            if operand_values and _maybe_type_token(operand_values[0]):
+                source_width_spec = operand_values.pop(0)
+            elif operand_values and _maybe_type_token(operand_values[-1]):
+                source_width_spec = operand_values.pop()
+        elif opcode in {"zext", "sext", "trunc"}:
+            if operand_values and _maybe_type_token(operand_values[0]):
+                source_width_spec = operand_values.pop(0)
+            if operand_values and _maybe_type_token(operand_values[-1]):
+                width_spec = operand_values.pop()
+        else:
+            if operand_values and _maybe_type_token(operand_values[0]):
+                width_spec = operand_values.pop(0)
             if (
-                _width_of(operands[-1]) is not None
-                and _as_literal(operands[-1]) is None
+                opcode
+                in {
+                    "add",
+                    "sub",
+                    "and",
+                    "or",
+                    "xor",
+                    "const",
+                    "constant",
+                    "literal",
+                    "phi",
+                    "select",
+                    *_SHIFT_OPS,
+                    *_ROTATE_OPS,
+                }
+                and operand_values
+                and _maybe_type_token(operand_values[-1])
             ):
-                width_spec = operands[-1]
-                operands = operands[:-1]
-        if operands and _maybe_type_token(operands[0]):
-            width_spec = width_spec or operands[0]
-            operands = operands[1:]
-        return _Operation(opcode, result, operands, width_spec, source=raw)
+                width_spec = width_spec or operand_values.pop()
+        return _Operation(
+            opcode,
+            result,
+            tuple(operand_values),
+            width_spec,
+            source_width_spec,
+            predicate,
+            None,
+            raw,
+        )
 
     opcode_raw = _field(raw, ("opcode", "op", "operation", "kind"), _MISSING)
     if opcode_raw is _MISSING:
@@ -378,10 +521,20 @@ def _parse_operation(raw: Any) -> _Operation:
         if candidate is _MISSING:
             raise SSAFormatError(f"instruction has no opcode: {raw!r}")
         opcode_raw = candidate
+    raw_opcode = str(opcode_raw)
+    raw_opcode_lower = raw_opcode.strip().lower()
     opcode = _normalise_opcode(opcode_raw)
+    predicate_raw = _field(
+        raw,
+        ("predicate", "pred", "condition_code", "comparison", "compare"),
+        None,
+    )
+    predicate = str(predicate_raw).lower() if predicate_raw is not None else None
+    if raw_opcode_lower.startswith(("icmp.", "icmp_")):
+        predicate = raw_opcode_lower.split(".", 1)[-1].split("_", 1)[-1]
+
     result_raw = _field(raw, ("result", "destination", "dest", "output"), _MISSING)
-    if result_raw is _MISSING and opcode not in {"ret", "return"}:
-        # Some compact instruction objects use ``name`` for their SSA result.
+    if result_raw is _MISSING and opcode not in _TERMINATORS:
         result_raw = _field(raw, ("name", "id", "identifier"), None)
     result = _normalise_name(result_raw)
 
@@ -393,6 +546,79 @@ def _parse_operation(raw: Any) -> _Operation:
             operands_raw = _field(raw, ("value", "literal", "constant", "integer"), ())
         elif opcode in {"zext", "sext", "trunc"}:
             operands_raw = _field(raw, ("operand", "value", "source"), ())
+        elif opcode == "select":
+            condition = _field(raw, ("condition", "cond", "predicate"), _MISSING)
+            true_value = _field(
+                raw,
+                ("true_value", "on_true", "if_true", "true_operand", "true"),
+                _MISSING,
+            )
+            false_value = _field(
+                raw,
+                ("false_value", "on_false", "if_false", "false_operand", "false"),
+                _MISSING,
+            )
+            if (
+                condition is not _MISSING
+                and true_value is not _MISSING
+                and false_value is not _MISSING
+            ):
+                operands_raw = (condition, true_value, false_value)
+            else:
+                operands_raw = ()
+        elif opcode == "phi":
+            operands_raw = _field(
+                raw,
+                (
+                    "incoming",
+                    "incomings",
+                    "incoming_values",
+                    "incoming_operands",
+                    "phi_incomings",
+                    "values",
+                ),
+                (),
+            )
+        elif opcode in _SHIFT_OPS | _ROTATE_OPS:
+            source = _field(
+                raw, ("source", "value", "operand", "lhs", "left"), _MISSING
+            )
+            amount = _field(
+                raw,
+                ("shift_amount", "amount", "rhs", "right", "count"),
+                _MISSING,
+            )
+            if source is not _MISSING and amount is not _MISSING:
+                operands_raw = (source, amount)
+            else:
+                operands_raw = ()
+        elif opcode == "br":
+            condition = _field(raw, ("condition", "cond", "predicate"), _MISSING)
+            true_target = _field(
+                raw,
+                ("true_target", "then_target", "if_true", "true_block", "then"),
+                _MISSING,
+            )
+            false_target = _field(
+                raw,
+                ("false_target", "else_target", "if_false", "false_block", "else"),
+                _MISSING,
+            )
+            target = _field(raw, ("target", "destination", "successor"), _MISSING)
+            targets = _field(raw, ("targets", "successors", "branches"), _MISSING)
+            if condition is not _MISSING and targets is not _MISSING:
+                target_values = tuple(targets)
+                operands_raw = (condition, *target_values)
+            elif condition is not _MISSING and true_target is not _MISSING:
+                operands_raw = (
+                    (condition, true_target, false_target)
+                    if false_target is not _MISSING
+                    else (condition, true_target)
+                )
+            elif target is not _MISSING:
+                operands_raw = (target,)
+            else:
+                operands_raw = ()
         else:
             lhs = _field(raw, ("lhs", "left", "first"), _MISSING)
             rhs = _field(raw, ("rhs", "right", "second"), _MISSING)
@@ -400,13 +626,18 @@ def _parse_operation(raw: Any) -> _Operation:
                 operands_raw = (lhs, rhs)
             else:
                 operands_raw = ()
-    if isinstance(operands_raw, str) or not isinstance(operands_raw, (tuple, list)):
+    operands: tuple[Any, ...]
+    if isinstance(operands_raw, str) or not isinstance(
+        operands_raw, (tuple, list, Mapping)
+    ):
         has_operand = (
             operands_raw is not None
             and operands_raw is not _MISSING
             and operands_raw != ()
         )
         operands = (operands_raw,) if has_operand else ()
+    elif isinstance(operands_raw, Mapping):
+        operands = (operands_raw,)
     else:
         operands = tuple(operands_raw)
 
@@ -426,15 +657,27 @@ def _parse_operation(raw: Any) -> _Operation:
     )
     source_width_spec = _field(
         raw,
-        ("source_width", "from_width", "operand_width", "source_type", "from_type"),
+        (
+            "source_width",
+            "from_width",
+            "operand_width",
+            "source_type",
+            "from_type",
+            "operand_type",
+            "comparison_type",
+        ),
         None,
     )
+    direction_raw = _field(raw, ("direction", "rotate_direction"), None)
+    direction = str(direction_raw).lower() if direction_raw is not None else None
     return _Operation(
         opcode,
         result,
         operands,
         width_spec,
         source_width_spec,
+        predicate,
+        direction,
         raw,
     )
 
@@ -469,6 +712,18 @@ def _explicit_return(function: Any) -> Any:
     return _MISSING
 
 
+def _comparison_width(operation: _Operation) -> int | None:
+    width = _width_of(operation.source_width_spec)
+    if width is not None:
+        return width
+    # Structural dictionaries often call the compared type simply ``width``.
+    # The typed frontend dataclass instead exposes result type i1 and carries
+    # the compared type in operand_type, so never infer a comparison width of 1
+    # from that result field.
+    candidate = _width_of(operation.width_spec)
+    return candidate if candidate != 1 else None
+
+
 class _Lowerer:
     def __init__(self, function: Any, function_name: str | None) -> None:
         self.function_name = function_name or _normalise_name(
@@ -479,7 +734,8 @@ class _Lowerer:
         self.values: dict[str, _Value] = {}
         self.constants: dict[tuple[int, int], _Value] = {}
         self._constant_counter = 0
-        self._return_value: _Value | None = None
+        self._temporary_counter = 0
+        self._returns: list[tuple[_Value, _Guard]] = []
         self._allocate_arguments(function)
 
     def _allocate_arguments(self, function: Any) -> None:
@@ -489,9 +745,31 @@ class _Lowerer:
             register = self.allocator.allocate_input(name, width)
             self.values[name] = _Value(name, width, register)
 
+    def _fresh_label(self, prefix: str) -> str:
+        label = f"{prefix}.{self._temporary_counter}"
+        self._temporary_counter += 1
+        return label
+
     def _error_context(self, operation: _Operation) -> str:
         function = f" in {self.function_name!r}" if self.function_name else ""
         return f"SSA operation {operation.opcode!r}{function}"
+
+    @staticmethod
+    def _source_location(operation: _Operation) -> Any:
+        return _field(operation.source, ("source_location", "location"), None)
+
+    def _unsupported(
+        self,
+        operation: _Operation,
+        message: str,
+        *,
+        construct: str | None = None,
+    ) -> None:
+        raise UnsupportedConstructError(
+            construct or f"SSA operation {operation.opcode!r}",
+            message,
+            self._source_location(operation),
+        )
 
     def _resolve(self, raw: Any, width_hint: int | None = None) -> _Value:
         if isinstance(raw, _Value):
@@ -685,10 +963,10 @@ class _Lowerer:
             raise SSAFormatError(
                 f"{self._error_context(operation)} has no destination width"
             )
-        if operation.opcode == "zext" and destination_width < source.width:
-            raise SSAFormatError("zext destination is narrower than its source")
-        if operation.opcode == "sext" and destination_width < source.width:
-            raise SSAFormatError("sext destination is narrower than its source")
+        if operation.opcode in {"zext", "sext"} and destination_width < source.width:
+            raise SSAFormatError(
+                f"{operation.opcode} destination is narrower than its source"
+            )
         if operation.opcode == "trunc" and destination_width > source.width:
             raise SSAFormatError("trunc destination is wider than its source")
         target = self._allocate_result(operation, destination_width)
@@ -703,7 +981,7 @@ class _Lowerer:
             for qubit in target.register.bits[source.width :]:
                 self.scheduler.cx(sign, qubit)
 
-    def _emit_constant(self, operation: _Operation) -> None:
+    def _emit_constant(self, operation: _Operation, *, known_constant: bool) -> None:
         if len(operation.operands) != 1:
             raise SSAFormatError(
                 f"{self._error_context(operation)} expects one integer literal"
@@ -720,86 +998,762 @@ class _Lowerer:
             )
         target = self._allocate_result(operation, width)
         self._set_constant(target, literal.value)
-        # Constants are SSA values too, but their fixed value is useful for
-        # recognizing NOT and simplifying bitwise operations.
+        # A value defined under a nontrivial path is not globally constant: it
+        # is physically zero when that path is inactive.
         self.values[target.name] = _Value(
             target.name,
             target.width,
             target.register,
-            literal.value & self._mask(width),
+            literal.value & self._mask(width) if known_constant else None,
         )
 
-    def _record_return(self, operation: _Operation) -> None:
+    def _temporary_value(self, register: Register, prefix: str) -> _Value:
+        return _Value(self._fresh_label(prefix), register.width, register)
+
+    def _emit_unsigned_less(
+        self, first: _Value, second: _Value, target: Register
+    ) -> None:
+        """Toggle ``target`` with ``first < second`` and clean comparison work."""
+
+        if first.width != second.width:
+            raise SSAFormatError("unsigned comparison operands have mismatched widths")
+        work = self.allocator.allocate_ancilla(
+            first.width, self._fresh_label("icmp.work")
+        )
+        borrow_in = self.allocator.allocate_ancilla(
+            1, self._fresh_label("icmp.borrow-in")
+        )
+        borrow = self.allocator.allocate_ancilla(1, self._fresh_label("icmp.borrow"))
+        start = self.scheduler.mark()
+        copy_bits(self.scheduler, first.register.bits, work.bits)
+        sub_with_borrow(
+            self.scheduler,
+            second.register,
+            work,
+            borrow_in.bits[0],
+            borrow.bits[0],
+        )
+        computation = self.scheduler.block(start)
+        copy_bits(self.scheduler, borrow.bits, target.bits)
+        self.scheduler.extend(reversed(computation))
+
+    def _emit_signed_less(
+        self, first: _Value, second: _Value, target: Register
+    ) -> None:
+        transformed_first = self.allocator.allocate_ancilla(
+            first.width, self._fresh_label("icmp.signed-first")
+        )
+        transformed_second = self.allocator.allocate_ancilla(
+            second.width, self._fresh_label("icmp.signed-second")
+        )
+        flag = self.allocator.allocate_ancilla(1, self._fresh_label("icmp.signed-flag"))
+        start_transform = self.scheduler.mark()
+        copy_bits(self.scheduler, first.register.bits, transformed_first.bits)
+        copy_bits(self.scheduler, second.register.bits, transformed_second.bits)
+        self.scheduler.x(transformed_first.bits[-1])
+        self.scheduler.x(transformed_second.bits[-1])
+        transform = self.scheduler.block(start_transform)
+        compare_start = self.scheduler.mark()
+        self._emit_unsigned_less(
+            self._temporary_value(transformed_first, "icmp.signed-a"),
+            self._temporary_value(transformed_second, "icmp.signed-b"),
+            flag,
+        )
+        compare = self.scheduler.block(compare_start)
+        copy_bits(self.scheduler, flag.bits, target.bits)
+        self.scheduler.extend(reversed(compare))
+        self.scheduler.extend(reversed(transform))
+
+    def _emit_equal(self, first: _Value, second: _Value, target: Register) -> None:
+        left = self.allocator.allocate_ancilla(1, self._fresh_label("icmp.eq-left"))
+        right = self.allocator.allocate_ancilla(1, self._fresh_label("icmp.eq-right"))
+        left_start = self.scheduler.mark()
+        self._emit_unsigned_less(first, second, left)
+        left_block = self.scheduler.block(left_start)
+        right_start = self.scheduler.mark()
+        self._emit_unsigned_less(second, first, right)
+        right_block = self.scheduler.block(right_start)
+        or_bits(self.scheduler, left, right, target)
+        self.scheduler.x(target.bits[0])
+        self.scheduler.extend(reversed(right_block))
+        self.scheduler.extend(reversed(left_block))
+
+    def _emit_icmp(self, operation: _Operation) -> None:
+        if len(operation.operands) != 2:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} expects two operands, "
+                f"got {len(operation.operands)}"
+            )
+        width_hint = _comparison_width(operation)
+        first = self._resolve(operation.operands[0], width_hint)
+        second = self._resolve(operation.operands[1], width_hint or first.width)
+        if first.width != second.width:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} has mismatched operand widths"
+            )
+        predicate = (operation.predicate or "").lower()
+        if predicate not in _ICMP_PREDICATES:
+            raise UnsupportedSSAOperation(
+                f"{self._error_context(operation)} has unsupported predicate "
+                f"{predicate!r}"
+            )
+        target = self._allocate_result(operation, 1)
+        if predicate == "eq":
+            self._emit_equal(first, second, target.register)
+        elif predicate == "ne":
+            self._emit_equal(first, second, target.register)
+            self.scheduler.x(target.register.bits[0])
+        else:
+            signed = predicate.startswith("s")
+            reverse = predicate in {"ugt", "ule", "sgt", "sle"}
+            strict = predicate in {"ult", "ugt", "slt", "sgt"}
+            left, right = (second, first) if reverse else (first, second)
+            if signed:
+                self._emit_signed_less(left, right, target.register)
+            else:
+                self._emit_unsigned_less(left, right, target.register)
+            if not strict:
+                self.scheduler.x(target.register.bits[0])
+
+    def _emit_select(self, operation: _Operation) -> None:
+        if len(operation.operands) != 3:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} expects condition and two values"
+            )
+        condition = self._resolve(operation.operands[0], 1)
+        true_value = self._resolve(
+            operation.operands[1], _width_of(operation.width_spec)
+        )
+        false_value = self._resolve(operation.operands[2], true_value.width)
+        if condition.width != 1:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} condition is not i1"
+            )
+        if true_value.width != false_value.width:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} has mismatched value widths"
+            )
+        target = self._allocate_result(operation, true_value.width)
+        if condition.constant is not None:
+            selected = true_value if condition.constant & 1 else false_value
+            copy_bits(self.scheduler, selected.register.bits, target.register.bits)
+            return
+        condition_bit = condition.register.bits[0]
+        copy_bits(self.scheduler, false_value.register.bits, target.register.bits)
+        for true_bit, false_bit, target_bit in zip(
+            true_value.register.bits,
+            false_value.register.bits,
+            target.register.bits,
+            strict=True,
+        ):
+            if true_bit == false_bit:
+                continue
+            if false_bit == condition_bit:
+                self.scheduler.cx(condition_bit, target_bit)
+            else:
+                self.scheduler.ccx(condition_bit, false_bit, target_bit)
+            if true_bit == condition_bit:
+                self.scheduler.cx(condition_bit, target_bit)
+            else:
+                self.scheduler.ccx(condition_bit, true_bit, target_bit)
+
+    def _emit_shift(self, operation: _Operation) -> None:
+        operands = operation.operands
+        if operation.opcode in {"fshl", "fshr"}:
+            if len(operands) != 3:
+                raise SSAFormatError(
+                    f"{self._error_context(operation)} expects two values and a shift"
+                )
+            first = self._resolve(operands[0], _width_of(operation.width_spec))
+            second = self._resolve(operands[1], first.width)
+            amount_raw = operands[2]
+            if first.register.bits != second.register.bits and not (
+                first.constant is not None and first.constant == second.constant
+            ):
+                self._unsupported(
+                    operation,
+                    "funnel shifts with distinct sources are not supported; "
+                    "use a rotate with one source",
+                    construct="funnel shift",
+                )
+            source = first
+            rotate_right = operation.opcode == "fshr"
+        else:
+            if len(operands) != 2:
+                raise SSAFormatError(
+                    f"{self._error_context(operation)} expects a value and a constant"
+                )
+            source = self._resolve(operands[0], _width_of(operation.width_spec))
+            amount_raw = operands[1]
+            rotate_right = operation.opcode in {"ror", "rotr", "rotate_right"}
+            if operation.opcode == "rotate":
+                rotate_right = operation.direction in {"right", "ror", "rotr"}
+        amount = self._resolve(amount_raw, source.width)
+        if amount.constant is None:
+            raise UnsupportedSSAOperation(
+                f"{self._error_context(operation)} requires a constant shift amount"
+            )
+        literal = _as_literal(amount_raw)
+        if literal is not None and literal.value < 0:
+            raise SSAFormatError("shift amount cannot be negative")
+        width = _width_of(operation.width_spec) or source.width
+        if width != source.width:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} result width differs from source"
+            )
+        target = self._allocate_result(operation, width)
+        count = amount.constant
+        if operation.opcode in _SHIFT_OPS:
+            if operation.opcode == "shl":
+                for index, source_bit in enumerate(source.register.bits):
+                    destination = index + count
+                    if destination < width:
+                        self.scheduler.cx(source_bit, target.register.bits[destination])
+            elif operation.opcode == "lshr":
+                for index, source_bit in enumerate(source.register.bits):
+                    destination = index - count
+                    if destination >= 0:
+                        self.scheduler.cx(source_bit, target.register.bits[destination])
+            else:
+                sign = source.register.bits[-1]
+                for destination in range(width):
+                    source_index = destination + count
+                    if source_index < width:
+                        self.scheduler.cx(
+                            source.register.bits[source_index],
+                            target.register.bits[destination],
+                        )
+                    else:
+                        self.scheduler.cx(sign, target.register.bits[destination])
+            return
+        if operation.opcode in _ROTATE_OPS:
+            if operation.opcode in {"fshl", "rol", "rotl", "rotate_left"}:
+                rotate_right = False
+            count %= width
+            for index, source_bit in enumerate(source.register.bits):
+                destination = (
+                    (index - count) % width if rotate_right else (index + count) % width
+                )
+                self.scheduler.cx(source_bit, target.register.bits[destination])
+            return
+        raise UnsupportedSSAOperation(
+            f"{self._error_context(operation)} is not a shift"
+        )
+
+    def _emit_phi(
+        self,
+        operation: _Operation,
+        block_name: str,
+        edge_guards: Mapping[tuple[str, str], list[_Guard]],
+    ) -> None:
+        incomings = self._phi_incomings(operation)
+        if not incomings:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} has no incoming values"
+            )
+        width_hint = _width_of(operation.width_spec)
+        resolved: list[tuple[_Value, str]] = []
+        for value_raw, predecessor in incomings:
+            value = self._resolve(value_raw, width_hint)
+            resolved.append((value, predecessor))
+        width = width_hint or resolved[0][0].width
+        if any(value.width != width for value, _ in resolved):
+            raise SSAFormatError(
+                f"{self._error_context(operation)} has mismatched widths"
+            )
+        target = self._allocate_result(operation, width)
+        for value, predecessor in resolved:
+            guards = edge_guards.get((predecessor, block_name), [])
+            if not guards and isinstance(value, str):
+                alternate = _block_name(value, "")
+                guards = edge_guards.get((alternate, block_name), [])
+                if guards:
+                    value = self._resolve(predecessor, width)
+            if not guards:
+                raise SSAFormatError(
+                    f"{self._error_context(operation)} has no edge from "
+                    f"{predecessor!r} to {block_name!r}"
+                )
+            for guard in guards:
+                self._copy_guarded(value.register.bits, target.register.bits, guard)
+
+    def _phi_incomings(self, operation: _Operation) -> tuple[tuple[Any, str], ...]:
+        raw_items: Any = operation.operands
+        if len(operation.operands) == 1 and isinstance(
+            operation.operands[0], (Mapping, list, tuple)
+        ):
+            first_item = operation.operands[0]
+            if isinstance(first_item, (Mapping, list)) or not (
+                len(first_item) >= 2
+                and not isinstance(first_item[0], (tuple, list, Mapping))
+            ):
+                raw_items = first_item
+        incoming_blocks = _field(
+            operation.source,
+            ("incoming_blocks", "predecessors", "incoming_labels"),
+            _MISSING,
+        )
+        if isinstance(raw_items, Mapping):
+            items: list[Any] = list(raw_items.items())
+        else:
+            try:
+                items = list(raw_items)
+            except TypeError as exc:
+                raise SSAFormatError("phi incoming values are not iterable") from exc
+        result: list[tuple[Any, str]] = []
+        for index, item in enumerate(items):
+            if isinstance(item, Mapping):
+                value = _field(item, ("value", "operand", "incoming_value"), _MISSING)
+                predecessor = _field(
+                    item,
+                    ("block", "predecessor", "pred", "label", "incoming_block"),
+                    _MISSING,
+                )
+                if value is _MISSING or predecessor is _MISSING:
+                    raise SSAFormatError(f"malformed phi incoming {item!r}")
+            elif isinstance(item, (tuple, list)) and len(item) >= 2:
+                value, predecessor = item[0], item[1]
+            elif incoming_blocks is not _MISSING:
+                blocks = tuple(incoming_blocks)
+                if index >= len(blocks):
+                    raise SSAFormatError(
+                        "phi incoming block count does not match values"
+                    )
+                value, predecessor = item, blocks[index]
+            else:
+                raise SSAFormatError(f"malformed phi incoming {item!r}")
+            result.append((value, _block_name(predecessor, f"incoming{index}")))
+        return tuple(result)
+
+    def _prepare_operation(self, operation: _Operation) -> None:
+        """Resolve literals before predication captures the operation gates."""
+
+        opcode = operation.opcode
+        if opcode in {"add", "sub", "and", "or", "xor", "icmp"}:
+            width_hint = (
+                _comparison_width(operation)
+                if opcode == "icmp"
+                else _width_of(operation.width_spec)
+            )
+            if len(operation.operands) >= 1:
+                first = self._resolve(operation.operands[0], width_hint)
+                if len(operation.operands) >= 2:
+                    self._resolve(operation.operands[1], width_hint or first.width)
+        elif opcode in {"zext", "sext", "trunc", "not", "copy", "mov", "identity"}:
+            if operation.operands:
+                self._resolve(
+                    operation.operands[0],
+                    _width_of(operation.source_width_spec)
+                    or _width_of(operation.width_spec),
+                )
+        elif opcode == "select":
+            if len(operation.operands) == 3:
+                self._resolve(operation.operands[0], 1)
+                width_hint = _width_of(operation.width_spec)
+                value = self._resolve(operation.operands[1], width_hint)
+                self._resolve(operation.operands[2], width_hint or value.width)
+        elif opcode in _SHIFT_OPS | _ROTATE_OPS:
+            if operation.operands:
+                source = self._resolve(
+                    operation.operands[0], _width_of(operation.width_spec)
+                )
+                if opcode in {"fshl", "fshr"} and len(operation.operands) >= 2:
+                    self._resolve(operation.operands[1], source.width)
+                    if len(operation.operands) >= 3:
+                        self._resolve(operation.operands[2], source.width)
+                elif len(operation.operands) >= 2:
+                    self._resolve(operation.operands[1], source.width)
+        elif opcode == "phi":
+            width_hint = _width_of(operation.width_spec)
+            for value, _ in self._phi_incomings(operation):
+                self._resolve(value, width_hint)
+        elif opcode in {"ret", "return"}:
+            operands = _return_operands(operation)
+            if operands:
+                self._resolve(operands[0], _width_of(operation.width_spec))
+
+    def _emit_operation_unconditional(
+        self, operation: _Operation, *, known_constant: bool
+    ) -> None:
+        opcode = operation.opcode
+        if opcode in {"const", "constant", "literal"}:
+            self._emit_constant(operation, known_constant=known_constant)
+        elif opcode in {"zext", "sext", "trunc"}:
+            self._emit_cast(operation)
+        elif opcode == "not":
+            if len(operation.operands) != 1:
+                raise SSAFormatError(
+                    f"{self._error_context(operation)} expects one operand"
+                )
+            source = self._resolve(
+                operation.operands[0], _width_of(operation.width_spec)
+            )
+            target = self._allocate_result(operation, source.width)
+            self._emit_not(source, target)
+        elif opcode in {"copy", "mov", "identity"}:
+            if len(operation.operands) != 1:
+                raise SSAFormatError(
+                    f"{self._error_context(operation)} expects one operand"
+                )
+            source = self._resolve(
+                operation.operands[0], _width_of(operation.width_spec)
+            )
+            target = self._allocate_result(operation, source.width)
+            copy_bits(self.scheduler, source.register.bits, target.register.bits)
+        elif opcode in {"add", "sub", "and", "or", "xor"}:
+            self._emit_binary(operation)
+        elif opcode == "icmp":
+            self._emit_icmp(operation)
+        elif opcode == "select":
+            self._emit_select(operation)
+        elif opcode in _SHIFT_OPS | _ROTATE_OPS:
+            self._emit_shift(operation)
+        else:
+            supported = ", ".join(sorted(_SUPPORTED - _TERMINATORS - {"phi"}))
+            raise UnsupportedSSAOperation(
+                f"unsupported {self._error_context(operation)}; "
+                f"v0.2 supports {supported}"
+            )
+
+    def _emit_predicated(self, operation: _Operation, guard: _Guard) -> None:
+        self._prepare_operation(operation)
+        start = self.scheduler.mark()
+        self._emit_operation_unconditional(
+            operation, known_constant=guard.constant is True
+        )
+        raw_gates = self.scheduler.block(start)
+        if guard.constant is True:
+            return
+        self.scheduler.discard_from(start)
+        if guard.constant is False:
+            return
+        assert guard.bit is not None
+        for gate in raw_gates:
+            self._append_controlled_gate(guard.bit, gate)
+
+    def _guard_for_value(self, value: _Value) -> _Guard:
+        if value.width != 1:
+            raise SSAFormatError("branch condition must have width one")
+        constant = value.constant
+        if constant is not None:
+            return _Guard(constant=bool(constant & 1))
+        return _Guard(bit=value.register.bits[0])
+
+    def _and_guard(self, parent: _Guard, condition: _Guard, invert: bool) -> _Guard:
+        desired = condition
+        if invert:
+            if desired.constant is not None:
+                desired = _Guard(constant=not desired.constant)
+            else:
+                desired = _Guard(bit=desired.bit)
+                # The complement is materialized below without changing the
+                # condition register permanently.
+        if parent.constant is False or desired.constant is False:
+            return _Guard(constant=False)
+        if desired.constant is True:
+            return parent
+        if parent.constant is True:
+            target = self.allocator.allocate_ancilla(1, self._fresh_label("path.not"))
+            if invert:
+                self.scheduler.x(target.bits[0])
+            assert condition.bit is not None
+            self.scheduler.cx(condition.bit, target.bits[0])
+            return _Guard(bit=target.bits[0])
+        assert parent.bit is not None and condition.bit is not None
+        if parent.bit == condition.bit:
+            return _Guard(constant=not invert)
+        target = self.allocator.allocate_ancilla(1, self._fresh_label("path.and"))
+        if invert:
+            self.scheduler.x(condition.bit)
+        self.scheduler.ccx(parent.bit, condition.bit, target.bits[0])
+        if invert:
+            self.scheduler.x(condition.bit)
+        return _Guard(bit=target.bits[0])
+
+    def _or_bit(self, first: int, second: int, target: int) -> None:
+        if first == second:
+            self.scheduler.cx(first, target)
+            return
+        self.scheduler.cx(first, target)
+        self.scheduler.cx(second, target)
+        self.scheduler.ccx(first, second, target)
+
+    def _or_guards(self, guards: Sequence[_Guard]) -> _Guard:
+        dynamic: list[int] = []
+        for guard in guards:
+            if guard.constant is True:
+                return _Guard(constant=True)
+            if guard.bit is not None and guard.bit not in dynamic:
+                dynamic.append(guard.bit)
+        if not dynamic:
+            return _Guard(constant=False)
+        current = dynamic[0]
+        for other in dynamic[1:]:
+            target = self.allocator.allocate_ancilla(1, self._fresh_label("path.or"))
+            self._or_bit(current, other, target.bits[0])
+            current = target.bits[0]
+        return _Guard(bit=current)
+
+    def _copy_guarded(
+        self, source: Sequence[int], target: Sequence[int], guard: _Guard
+    ) -> None:
+        if guard.constant is False:
+            return
+        if guard.constant is True:
+            copy_bits(self.scheduler, source, target)
+            return
+        assert guard.bit is not None
+        for source_bit, target_bit in zip(source, target, strict=True):
+            if source_bit == target_bit:
+                continue
+            if source_bit == guard.bit:
+                self.scheduler.cx(guard.bit, target_bit)
+            else:
+                self.scheduler.ccx(guard.bit, source_bit, target_bit)
+
+    def _append_controlled_gate(self, guard: int, gate: Gate) -> None:
+        controls = gate.controls
+        target = gate.target
+        if target == guard:
+            raise SSAFormatError("a predicated operation would modify its path guard")
+        if gate.name == "x":
+            self.scheduler.cx(guard, target)
+        elif gate.name == "cx":
+            control = controls[0]
+            if control == guard:
+                self.scheduler.cx(control, target)
+            else:
+                self.scheduler.ccx(guard, control, target)
+        elif gate.name == "ccx":
+            if guard in controls:
+                self.scheduler.ccx(controls[0], controls[1], target)
+                return
+            workspace = self.allocator.allocate_ancilla(
+                1, self._fresh_label("controlled.and")
+            )
+            self.scheduler.ccx(controls[0], controls[1], workspace.bits[0])
+            self.scheduler.ccx(guard, workspace.bits[0], target)
+            self.scheduler.ccx(controls[0], controls[1], workspace.bits[0])
+        else:  # pragma: no cover - Gate validates this before lowering sees it.
+            raise SSAFormatError(f"cannot control unsupported gate {gate.name!r}")
+
+    @staticmethod
+    def _branch(operation: _Operation) -> tuple[Any | None, str, str | None]:
+        operands = operation.operands
+        if len(operands) == 1:
+            return None, _block_name(operands[0], "target"), None
+        if len(operands) == 3:
+            return (
+                operands[0],
+                _block_name(operands[1], "true"),
+                _block_name(operands[2], "false"),
+            )
+        raise SSAFormatError(
+            "conditional branches require a condition, true target, and false target"
+        )
+
+    @staticmethod
+    def _terminator(block: _Block) -> _Operation | None:
+        terminator: _Operation | None = None
+        for index, operation in enumerate(block.operations):
+            if operation.opcode in _TERMINATORS:
+                if index != len(block.operations) - 1:
+                    raise SSAFormatError(
+                        f"block {block.name!r} contains instructions after "
+                        "its terminator"
+                    )
+                terminator = operation
+        return terminator
+
+    def _record_return(self, operation: _Operation, guard: _Guard) -> None:
         operands = _return_operands(operation)
         if len(operands) != 1:
             raise SSAFormatError(
                 f"{self._error_context(operation)} expects one returned value"
             )
-        self._return_value = self._resolve(operands[0])
+        value = self._resolve(operands[0], _width_of(operation.width_spec))
+        self._returns.append((value, guard))
 
     def lower(self, function: Any) -> LoweredCircuit:
-        for raw_operation in _extract_instructions(function):
-            operation = _parse_operation(raw_operation)
-            if operation.opcode in {"ret", "return"}:
-                self._record_return(operation)
-                continue
-            if operation.opcode not in _SUPPORTED:
-                supported = ", ".join(sorted(_SUPPORTED - {"ret", "return"}))
-                raise UnsupportedSSAOperation(
-                    f"unsupported {self._error_context(operation)}; "
-                    f"v0.1 supports {supported}"
-                )
-            if operation.opcode in {"const", "constant", "literal"}:
-                self._emit_constant(operation)
-            elif operation.opcode in {"zext", "sext", "trunc"}:
-                self._emit_cast(operation)
-            elif operation.opcode == "not":
-                if len(operation.operands) != 1:
+        blocks = _extract_blocks(function)
+        if not blocks:
+            raise SSAFormatError("function has no basic blocks or instructions")
+        by_name = {block.name: block for block in blocks}
+        terminators = {block.name: self._terminator(block) for block in blocks}
+        successors: dict[str, tuple[str, ...]] = {}
+        for block in blocks:
+            terminator = terminators[block.name]
+            if terminator is None:
+                if len(blocks) != 1:
                     raise SSAFormatError(
-                        f"{self._error_context(operation)} expects one operand"
+                        f"block {block.name!r} has no terminator in a multi-block CFG"
                     )
-                source = self._resolve(
-                    operation.operands[0], _width_of(operation.width_spec)
-                )
-                target = self._allocate_result(operation, source.width)
-                self._emit_not(source, target)
-            elif operation.opcode in {"copy", "mov", "identity"}:
-                if len(operation.operands) != 1:
+                successors[block.name] = ()
+            elif terminator.opcode in {"ret", "return"}:
+                successors[block.name] = ()
+            elif terminator.opcode == "br":
+                condition, true_target, false_target = self._branch(terminator)
+                del condition
+                if false_target is None:
+                    targets: tuple[str, ...] = (true_target,)
+                else:
+                    if true_target == false_target:
+                        raise UnsupportedConstructError(
+                            "ambiguous branch",
+                            "a conditional branch cannot use the same target for "
+                            "both paths",
+                            self._source_location(terminator),
+                        )
+                    targets = (true_target, false_target)
+                if any(target not in by_name for target in targets):
                     raise SSAFormatError(
-                        f"{self._error_context(operation)} expects one operand"
+                        f"block {block.name!r} branches to an unknown block"
                     )
-                source = self._resolve(
-                    operation.operands[0], _width_of(operation.width_spec)
+                successors[block.name] = targets
+            elif terminator.opcode in {"switch", "unreachable"}:
+                raise UnsupportedConstructError(
+                    f"{terminator.opcode} control flow",
+                    f"{terminator.opcode} control flow is outside the acyclic "
+                    "diamond subset",
+                    self._source_location(terminator),
                 )
-                target = self._allocate_result(operation, source.width)
-                copy_bits(self.scheduler, source.register.bits, target.register.bits)
             else:
-                self._emit_binary(operation)
+                raise UnsupportedSSAOperation(
+                    f"unsupported terminator {terminator.opcode!r}"
+                )
 
-        if self._return_value is None:
+        indegree = {block.name: 0 for block in blocks}
+        for targets in successors.values():
+            for target in targets:
+                indegree[target] += 1
+        ready = [block.name for block in blocks if indegree[block.name] == 0]
+        topological: list[str] = []
+        while ready:
+            name = ready.pop(0)
+            topological.append(name)
+            for target in successors[name]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    ready.append(target)
+        if len(topological) != len(blocks):
+            raise UnsupportedConstructError(
+                "cyclic control flow",
+                "cyclic CFGs and data-dependent loops are not supported by "
+                "v0.2 lowering",
+            )
+        reachable: set[str] = set()
+        pending = [blocks[0].name]
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            pending.extend(successors[name])
+        if len(reachable) != len(blocks):
+            raise UnsupportedConstructError(
+                "unreachable basic block",
+                "all basic blocks must be reachable from the entry block",
+            )
+        topological = [name for name in topological if name in reachable]
+
+        incoming: dict[str, list[str]] = {block.name: [] for block in blocks}
+        for predecessor, targets in successors.items():
+            for target in targets:
+                incoming[target].append(predecessor)
+        edge_guards: dict[tuple[str, str], list[_Guard]] = {}
+        block_guards: dict[str, _Guard] = {blocks[0].name: _Guard(constant=True)}
+
+        for block_name in topological:
+            block = by_name[block_name]
+            if block_name == blocks[0].name:
+                guard = block_guards[block_name]
+            else:
+                incoming_guards: list[_Guard] = []
+                for predecessor in incoming[block_name]:
+                    incoming_guards.extend(
+                        edge_guards.get((predecessor, block_name), [])
+                    )
+                if not incoming_guards:
+                    raise SSAFormatError(
+                        f"block {block_name!r} has no computed incoming path"
+                    )
+                guard = self._or_guards(incoming_guards)
+                block_guards[block_name] = guard
+
+            terminator = terminators[block_name]
+            body = block.operations[:-1] if terminator is not None else block.operations
+            for operation in body:
+                if operation.opcode == "phi":
+                    self._prepare_operation(operation)
+                    self._emit_phi(operation, block_name, edge_guards)
+                elif operation.opcode in _SUPPORTED - _TERMINATORS:
+                    self._emit_predicated(operation, guard)
+                else:
+                    supported = ", ".join(sorted(_SUPPORTED - _TERMINATORS))
+                    raise UnsupportedSSAOperation(
+                        f"unsupported {self._error_context(operation)}; "
+                        f"v0.2 supports {supported}"
+                    )
+
+            if terminator is None:
+                continue
+            if terminator.opcode in {"ret", "return"}:
+                self._prepare_operation(terminator)
+                self._record_return(terminator, guard)
+            elif terminator.opcode == "br":
+                condition_raw, true_target, false_target = self._branch(terminator)
+                if false_target is None:
+                    edge_guards.setdefault((block_name, true_target), []).append(guard)
+                else:
+                    condition = self._resolve(condition_raw, 1)
+                    condition_guard = self._guard_for_value(condition)
+                    true_guard = self._and_guard(guard, condition_guard, False)
+                    false_guard = self._and_guard(guard, condition_guard, True)
+                    edge_guards.setdefault((block_name, true_target), []).append(
+                        true_guard
+                    )
+                    edge_guards.setdefault((block_name, false_target), []).append(
+                        false_guard
+                    )
+
+        if not self._returns:
             explicit = _explicit_return(function)
             if explicit is not _MISSING:
                 if isinstance(explicit, (tuple, list)) and len(explicit) == 1:
                     explicit = explicit[0]
-                self._return_value = self._resolve(explicit)
-        if self._return_value is None:
+                return_width = _width_of(
+                    _field(function, ("return_type", "result_type", "type"), None)
+                )
+                self._returns.append(
+                    (self._resolve(explicit, return_width), _Guard(constant=True))
+                )
+        if not self._returns:
             raise SSAFormatError(
                 f"function {self.function_name or '<anonymous>'!r} has no return value"
             )
 
+        return_width = self._returns[0][0].width
+        if any(value.width != return_width for value, _ in self._returns):
+            raise SSAFormatError("return values have mismatched widths")
+        declared_width = _width_of(
+            _field(function, ("return_type", "result_type"), None)
+        )
+        if declared_width is not None and declared_width != return_width:
+            raise SSAFormatError(
+                f"return width {return_width} does not match declared width "
+                f"{declared_width}"
+            )
+
         output = self.allocator.allocate_output(
-            self._return_value.width,
+            return_width,
             name=f"{self.function_name or 'function'}.output",
         )
         computation = self.scheduler.gates
-        copy_bits(
-            self.scheduler,
-            self._return_value.register.bits,
-            output.bits,
-        )
-        # Every gate emitted before the output copy is part of the computation.
-        # Reversing it restores input-independent SSA values, constants, and
-        # arithmetic carries while leaving the copied output untouched.
+        for value, guard in self._returns:
+            self._copy_guarded(value.register.bits, output.bits, guard)
+        # Output copies are deliberately appended after all path predicates and
+        # SSA values have been computed.  Reversing only the earlier schedule
+        # Bennett-cleans every temporary without touching the output register.
         self.scheduler.extend(reversed(computation))
         layout = self.allocator.layout(output)
         return LoweredCircuit(
@@ -811,7 +1765,7 @@ class _Lowerer:
 
 
 def lower_ssa(function: Any, *, function_name: str | None = None) -> LoweredCircuit:
-    """Lower one straight-line SSA function into a Bennett-clean circuit."""
+    """Lower one fixed-width SSA function into a Bennett-clean circuit."""
 
     return _Lowerer(function, function_name).lower(function)
 
