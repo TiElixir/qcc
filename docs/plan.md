@@ -22,6 +22,10 @@ compute-copy-uncompute so every temporary returns to its initial value.
 
 ### v0.1 — straight-line uint8_t
 
+**Status:** The v0.1 straight-line boundary is the current implementation
+baseline. This plan records the acceptance commands but does not claim that
+they have been run successfully for this checkout.
+
 1. Bootstrap packaging, CI, errors, and documentation.
 2. Invoke Clang with optimized, non-vectorized textual LLVM output.
 3. Parse typed single-block SSA for integer operations, casts, and returns.
@@ -45,13 +49,21 @@ pytest -q
 
 ### v0.2 — comparisons, predication, and bounded loops
 
+**Status:** The v0.2 semantic contract is being specified in this milestone.
+Implementation, integration, and acceptance evidence remain pending; the
+status language here makes no claim about unverified tests.
+
 1. Add all integer `icmp` predicates, `select`, `phi`, and acyclic CFG support.
-2. Lower reversible muxes and nested if/else diamonds.
+2. Lower reversible predicates, muxes, and nested if/else diamonds while
+   preserving clean inputs and workspaces.
 3. Add constant shifts/rotates as wiring and constant-bound loop unrolling.
 4. Reject cycles that remain after the frontend unroll pass and reject every
    unsupported construct with a source-aware diagnostic.
 
 ### v0.3 — arithmetic growth and quantum host integration
+
+**Status:** Planned after the v0.2 contract and its acceptance evidence are
+complete.
 
 1. Add multiplication and constant-divisor division/remainder.
 2. Add controlled arithmetic, MCX intermediate gates, and decomposition to
@@ -60,6 +72,8 @@ pytest -q
 4. Add the required Grover oracle, optional Qiskit demo, and statevector tests.
 
 ### v0.4 — optimization and measured resource reduction
+
+**Status:** Planned; no performance result is implied by this plan.
 
 1. Add SSA constant folding and dead-value elimination.
 2. Add gate cancellation, commuting simplifications, and eager uncomputation.
