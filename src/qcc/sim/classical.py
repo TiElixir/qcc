@@ -103,6 +103,10 @@ def read_register(state: int, register: Iterable[QubitLike]) -> int:
     if not isinstance(state, int) or state < 0:
         raise ValueError("state must be a non-negative integer bitmask")
     values = _normalize_register(register)
+    if values and all(
+        int(qubit) == int(values[0]) + offset for offset, qubit in enumerate(values)
+    ):
+        return (state >> _as_index(values[0])) & ((1 << len(values)) - 1)
     result = 0
     for offset, qubit in enumerate(values):
         if (state >> _as_index(qubit)) & 1:
@@ -121,6 +125,12 @@ def assign_register(state: int, register: Iterable[QubitLike], value: object) ->
         raise ValueError("state must be a non-negative integer bitmask")
     values = _normalize_register(register)
     integer = _coerce_value(value, len(values))
+    if values and all(
+        int(qubit) == int(values[0]) + offset for offset, qubit in enumerate(values)
+    ):
+        start = _as_index(values[0])
+        mask = ((1 << len(values)) - 1) << start
+        return (state & ~mask) | (integer << start)
     for qubit in values:
         state &= ~(1 << _as_index(qubit))
     for offset, qubit in enumerate(values):
@@ -287,16 +297,19 @@ def simulate(
             )
 
     entries: list[TraceEntry] = []
-    for step, gate in enumerate(circuit.gates):
-        before = state
-        state = _apply_gate(state, gate)
-        if trace is True:
-            entries.append(TraceEntry(step, gate, before, state))
-        elif isinstance(trace, list):
-            entry = TraceEntry(step, gate, before, state)
-            trace.append(entry)
-        elif callable(trace):
-            trace(TraceEntry(step, gate, before, state))
+    if trace is False:
+        state = circuit.fast_simulate(state)
+    else:
+        for step, gate in enumerate(circuit.gates):
+            before = state
+            state = _apply_gate(state, gate)
+            if trace is True:
+                entries.append(TraceEntry(step, gate, before, state))
+            elif isinstance(trace, list):
+                entry = TraceEntry(step, gate, before, state)
+                trace.append(entry)
+            elif callable(trace):
+                trace(TraceEntry(step, gate, before, state))
 
     declared_ancillas = _resolve_ancillas(circuit, ancillas)
     if check_ancillas:

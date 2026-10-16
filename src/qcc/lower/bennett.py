@@ -22,9 +22,12 @@ class Gate:
     def __post_init__(self) -> None:
         name = self.name.lower()
         expected = {"x": 1, "cx": 2, "ccx": 3}.get(name)
-        if expected is None:
+        if name == "mcx":
+            if len(self.qubits) < 4:
+                raise GateError("mcx requires at least three controls and a target")
+        elif expected is None:
             raise GateError(f"unsupported reversible gate {self.name!r}")
-        if len(self.qubits) != expected:
+        elif len(self.qubits) != expected:
             raise GateError(f"{name} expects {expected} qubits, got {len(self.qubits)}")
         if any(qubit < 0 for qubit in self.qubits):
             raise GateError("gate qubit indices cannot be negative")
@@ -77,6 +80,9 @@ class GateBuffer:
 
     def ccx(self, control_a: int, control_b: int, target: int) -> None:
         self._gates.append(Gate("ccx", (control_a, control_b, target)))
+
+    def mcx(self, controls: Sequence[int], target: int) -> None:
+        self._gates.append(Gate("mcx", (*controls, target)))
 
     def append(self, gate: Gate) -> None:
         self._gates.append(gate)

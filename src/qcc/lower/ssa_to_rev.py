@@ -24,7 +24,6 @@ from .bennett import (
     copy_bits,
     or_bits,
     sub_registers,
-    sub_with_borrow,
     xor_bits,
 )
 
@@ -566,6 +565,27 @@ def _parse_operation(raw: Any) -> _Operation:
                 operands_raw = (condition, true_value, false_value)
             else:
                 operands_raw = ()
+    if opcode == "br":
+        # The canonical frontend stores branch destinations separately from
+        # value operands.  Normalize them to the compact (condition, true,
+        # false) shape consumed by the CFG scheduler.
+        targets_raw = _field(
+            raw, ("targets", "branch_targets", "successors", "branches"), _MISSING
+        )
+        if targets_raw is not _MISSING and targets_raw is not None:
+            targets = tuple(targets_raw)
+            existing = (
+                tuple(operands_raw)
+                if isinstance(operands_raw, (tuple, list))
+                else (
+                    ()
+                    if operands_raw is _MISSING
+                    or operands_raw is None
+                    or operands_raw == ()
+                    else (operands_raw,)
+                )
+            )
+            operands_raw = existing + targets
         elif opcode == "phi":
             operands_raw = _field(
                 raw,
@@ -1013,29 +1033,81 @@ class _Lowerer:
     def _emit_unsigned_less(
         self, first: _Value, second: _Value, target: Register
     ) -> None:
-        """Toggle ``target`` with ``first < second`` and clean comparison work."""
+        """Toggle ``target`` with ``first < second`` and clean comparison work.
+
+        The construction walks from the most-significant bit downward.  A
+        clean prefix register records that every more-significant pair is
+        equal; each first-difference term is then a mutually exclusive
+        multi-controlled X.  This is substantially smaller than materializing
+        a full subtractor when the circuit already permits first-class MCX
+        gates, while the later backend can decompose those gates if required.
+        """
 
         if first.width != second.width:
             raise SSAFormatError("unsigned comparison operands have mismatched widths")
-        work = self.allocator.allocate_ancilla(
-            first.width, self._fresh_label("icmp.work")
+        difference = self.allocator.allocate_ancilla(
+            first.width, self._fresh_label("icmp.difference")
         )
-        borrow_in = self.allocator.allocate_ancilla(
-            1, self._fresh_label("icmp.borrow-in")
+        prefix = self.allocator.allocate_ancilla(
+            first.width, self._fresh_label("icmp.equal-prefix")
         )
-        borrow = self.allocator.allocate_ancilla(1, self._fresh_label("icmp.borrow"))
-        start = self.scheduler.mark()
-        copy_bits(self.scheduler, first.register.bits, work.bits)
-        sub_with_borrow(
-            self.scheduler,
-            second.register,
-            work,
-            borrow_in.bits[0],
-            borrow.bits[0],
+        for first_bit, second_bit, difference_bit in zip(
+            first.register.bits,
+            second.register.bits,
+            difference.bits,
+            strict=True,
+        ):
+            self.scheduler.cx(first_bit, difference_bit)
+            self.scheduler.cx(second_bit, difference_bit)
+
+        most_significant = first.width - 1
+        self.scheduler.x(prefix.bits[most_significant])
+        self.scheduler.cx(
+            difference.bits[most_significant], prefix.bits[most_significant]
         )
-        computation = self.scheduler.block(start)
-        copy_bits(self.scheduler, borrow.bits, target.bits)
-        self.scheduler.extend(reversed(computation))
+        for index in range(most_significant - 1, -1, -1):
+            self.scheduler.x(difference.bits[index])
+            self.scheduler.ccx(
+                prefix.bits[index + 1],
+                difference.bits[index],
+                prefix.bits[index],
+            )
+            self.scheduler.x(difference.bits[index])
+
+        first_msb = first.register.bits[most_significant]
+        second_msb = second.register.bits[most_significant]
+        self.scheduler.x(first_msb)
+        self.scheduler.ccx(first_msb, second_msb, target.bits[0])
+        self.scheduler.x(first_msb)
+        for index in range(most_significant - 1, -1, -1):
+            first_bit = first.register.bits[index]
+            self.scheduler.x(first_bit)
+            self._append_multi_controlled_x(
+                (prefix.bits[index + 1], first_bit, second.register.bits[index]),
+                target.bits[0],
+            )
+            self.scheduler.x(first_bit)
+
+        for index in range(0, most_significant):
+            self.scheduler.x(difference.bits[index])
+            self.scheduler.ccx(
+                prefix.bits[index + 1],
+                difference.bits[index],
+                prefix.bits[index],
+            )
+            self.scheduler.x(difference.bits[index])
+        self.scheduler.cx(
+            difference.bits[most_significant], prefix.bits[most_significant]
+        )
+        self.scheduler.x(prefix.bits[most_significant])
+        for first_bit, second_bit, difference_bit in zip(
+            reversed(first.register.bits),
+            reversed(second.register.bits),
+            reversed(difference.bits),
+            strict=True,
+        ):
+            self.scheduler.cx(second_bit, difference_bit)
+            self.scheduler.cx(first_bit, difference_bit)
 
     def _emit_signed_less(
         self, first: _Value, second: _Value, target: Register
@@ -1065,18 +1137,43 @@ class _Lowerer:
         self.scheduler.extend(reversed(transform))
 
     def _emit_equal(self, first: _Value, second: _Value, target: Register) -> None:
-        left = self.allocator.allocate_ancilla(1, self._fresh_label("icmp.eq-left"))
-        right = self.allocator.allocate_ancilla(1, self._fresh_label("icmp.eq-right"))
-        left_start = self.scheduler.mark()
-        self._emit_unsigned_less(first, second, left)
-        left_block = self.scheduler.block(left_start)
-        right_start = self.scheduler.mark()
-        self._emit_unsigned_less(second, first, right)
-        right_block = self.scheduler.block(right_start)
-        or_bits(self.scheduler, left, right, target)
-        self.scheduler.x(target.bits[0])
-        self.scheduler.extend(reversed(right_block))
-        self.scheduler.extend(reversed(left_block))
+        if first.width != second.width:
+            raise SSAFormatError("equality operands have mismatched widths")
+        difference = self.allocator.allocate_ancilla(
+            first.width, self._fresh_label("icmp.eq-difference")
+        )
+        for first_bit, second_bit, difference_bit in zip(
+            first.register.bits,
+            second.register.bits,
+            difference.bits,
+            strict=True,
+        ):
+            self.scheduler.cx(first_bit, difference_bit)
+            self.scheduler.cx(second_bit, difference_bit)
+        for difference_bit in difference.bits:
+            self.scheduler.x(difference_bit)
+        self._append_multi_controlled_x(difference.bits, target.bits[0])
+        for difference_bit in difference.bits:
+            self.scheduler.x(difference_bit)
+        for first_bit, second_bit, difference_bit in zip(
+            reversed(first.register.bits),
+            reversed(second.register.bits),
+            reversed(difference.bits),
+            strict=True,
+        ):
+            self.scheduler.cx(second_bit, difference_bit)
+            self.scheduler.cx(first_bit, difference_bit)
+
+    def _append_multi_controlled_x(self, controls: Sequence[int], target: int) -> None:
+        control_tuple = tuple(controls)
+        if target in control_tuple:
+            raise SSAFormatError("a multi-controlled X target overlaps a control")
+        if len(control_tuple) == 1:
+            self.scheduler.cx(control_tuple[0], target)
+        elif len(control_tuple) == 2:
+            self.scheduler.ccx(control_tuple[0], control_tuple[1], target)
+        else:
+            self.scheduler.append(Gate("mcx", (*control_tuple, target)))
 
     def _emit_icmp(self, operation: _Operation) -> None:
         if len(operation.operands) != 2:
@@ -1528,12 +1625,14 @@ class _Lowerer:
             if guard in controls:
                 self.scheduler.ccx(controls[0], controls[1], target)
                 return
-            workspace = self.allocator.allocate_ancilla(
-                1, self._fresh_label("controlled.and")
+            self.scheduler.append(
+                Gate("mcx", (guard, controls[0], controls[1], target))
             )
-            self.scheduler.ccx(controls[0], controls[1], workspace.bits[0])
-            self.scheduler.ccx(guard, workspace.bits[0], target)
-            self.scheduler.ccx(controls[0], controls[1], workspace.bits[0])
+        elif gate.name == "mcx":
+            if guard in controls:
+                self.scheduler.append(gate)
+            else:
+                self.scheduler.append(Gate("mcx", (guard, *controls, target)))
         else:  # pragma: no cover - Gate validates this before lowering sees it.
             raise SSAFormatError(f"cannot control unsupported gate {gate.name!r}")
 

@@ -9,8 +9,8 @@ its :meth:`~CircuitBuilder.build` method freezes the gate sequence in a
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
 from operator import index as _index
 from types import MappingProxyType
 from typing import Any, ClassVar, TypeAlias
@@ -520,6 +520,12 @@ class Circuit:
     layout: CircuitLayout | None
     domain: object | None
     name: str | None
+    _compiled: tuple[tuple[int, int, int], ...] = field(
+        init=False, repr=False, compare=False
+    )
+    _fast_simulator: Callable[[int], int] | None = field(
+        init=False, repr=False, compare=False
+    )
 
     def __init__(
         self,
@@ -574,6 +580,15 @@ class Circuit:
         object.__setattr__(self, "layout", layout)
         object.__setattr__(self, "domain", actual_domain)
         object.__setattr__(self, "name", name)
+        compiled: list[tuple[int, int, int]] = []
+        operation_codes = {"X": 0, "CX": 1, "CCX": 2, "MCX": 3}
+        for gate in gate_tuple:
+            controls = 0
+            for qubit in gate.controls:
+                controls |= 1 << int(qubit)
+            compiled.append((operation_codes[gate.op], controls, 1 << int(gate.target)))
+        object.__setattr__(self, "_compiled", tuple(compiled))
+        object.__setattr__(self, "_fast_simulator", None)
 
     @classmethod
     def empty(
@@ -599,6 +614,38 @@ class Circuit:
     @property
     def ancillas(self) -> tuple[QubitLike, ...]:
         return () if self.layout is None else self.layout.ancillas
+
+    @property
+    def compiled_gates(self) -> tuple[tuple[int, int, int], ...]:
+        """Return simulator-ready ``(opcode, controls, target)`` masks."""
+
+        return self._compiled
+
+    def fast_simulate(self, state: int) -> int:
+        """Run a cached straight-line integer evaluator for this circuit.
+
+        The ordinary simulator remains gate-oriented when tracing is enabled.
+        For repeated basis-state differential tests this generated evaluator
+        removes Python object dispatch from the hot loop without changing the
+        circuit semantics or gate representation.
+        """
+
+        if self._fast_simulator is None:
+            lines = ["def _run(state):"]
+            for opcode, controls, target in self._compiled:
+                if opcode == 0:
+                    lines.append(f"    state ^= {target}")
+                else:
+                    lines.append(
+                        f"    if state & {controls} == {controls}: state ^= {target}"
+                    )
+            lines.append("    return state")
+            namespace: dict[str, Any] = {}
+            exec("\n".join(lines), {}, namespace)
+            object.__setattr__(self, "_fast_simulator", namespace["_run"])
+        simulator = self._fast_simulator
+        assert simulator is not None
+        return simulator(state)
 
     @property
     def qubits(self) -> tuple[int, ...]:

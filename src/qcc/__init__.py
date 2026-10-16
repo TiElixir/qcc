@@ -291,7 +291,7 @@ def _function_name(value: Any) -> str | None:
     return str(name) if name is not None else None
 
 
-def _parse_frontend_text(value: Any) -> Any:
+def _parse_frontend_text(value: Any, *, source_name: str = "<llvm>") -> Any:
     """Turn textual LLVM returned by the clang adapter into an SSA module."""
 
     if isinstance(value, bytes):
@@ -305,15 +305,21 @@ def _parse_frontend_text(value: Any) -> Any:
             continue
         parser = getattr(module, "parse_module", None) or getattr(module, "parse", None)
         if callable(parser):
-            return parser(value)
+            try:
+                return parser(value, source_name=source_name)
+            except TypeError:
+                return parser(value)
     raise ImportError("qcc frontend returned LLVM text but no LLVM parser is available")
 
 
-def _materialize_frontend_result(value: Any) -> Any:
+def _materialize_frontend_result(value: Any, *, source_name: str = "<llvm>") -> Any:
     if isinstance(value, (str, bytes)):
-        return _parse_frontend_text(value)
+        return _parse_frontend_text(value, source_name=source_name)
     if isinstance(value, tuple):
-        return tuple(_materialize_frontend_result(item) for item in value)
+        return tuple(
+            _materialize_frontend_result(item, source_name=source_name)
+            for item in value
+        )
     return value
 
 
@@ -432,9 +438,9 @@ def _invoke_frontend(
             "source_code",
         }:
             value = (
-                source_text
-                if source_text is not None
-                else (path.read_text() if path is not None else source_value)
+                path
+                if path is not None
+                else (source_text if source_text is not None else source_value)
             )
             if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
                 positional.append(value)
@@ -444,6 +450,9 @@ def _invoke_frontend(
         elif name in {"function", "function_name", "entry", "entrypoint"}:
             if parameter.kind is not inspect.Parameter.POSITIONAL_ONLY:
                 kwargs[parameter.name] = function
+        elif name in {"source_name", "filename_label", "input_name"}:
+            if parameter.kind is not inspect.Parameter.POSITIONAL_ONLY:
+                kwargs[parameter.name] = str(path) if path is not None else "<stdin>"
         elif name in {"opt", "optimization", "optimization_level", "opt_level", "o"}:
             if parameter.kind is not inspect.Parameter.POSITIONAL_ONLY:
                 kwargs[parameter.name] = opt
@@ -488,7 +497,7 @@ def _find_frontend_callable() -> Callable[..., Any]:
     )
 
 
-def compile_c(source_or_path: Any, function: str | None = "main", opt: int = 2) -> Any:
+def compile_c(source_or_path: Any, function: str | None = "main", opt: int = 1) -> Any:
     """Compile C source text or a C path into a reversible :class:`Circuit`.
 
     ``function`` selects the fixed-width SSA function emitted by the frontend;
@@ -503,8 +512,11 @@ def compile_c(source_or_path: Any, function: str | None = "main", opt: int = 2) 
         lowered = lower_ssa(source_or_path, function_name=function)
         return _construct_circuit(lowered)
     frontend = _find_frontend_callable()
+    _, _, source_path = _source_and_path(source_or_path)
+    source_name = str(source_path) if source_path is not None else "<stdin>"
     frontend_result = _materialize_frontend_result(
-        _invoke_frontend(frontend, source_or_path, function, opt)
+        _invoke_frontend(frontend, source_or_path, function, opt),
+        source_name=source_name,
     )
     selected = _select_function(frontend_result, function)
     if _looks_like_circuit(selected):
@@ -598,7 +610,7 @@ def simulate(
     circuit_or_source: Any,
     inputs: Any = None,
     function: str | None = "main",
-    opt: int = 2,
+    opt: int = 1,
 ) -> int:
     """Simulate a compiled circuit or compile and simulate C source/path."""
 

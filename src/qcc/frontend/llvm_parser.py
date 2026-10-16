@@ -9,7 +9,9 @@ program shape is an integer-typed function with an acyclic control-flow graph.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from qcc.errors import LLVMParseError, SourceLocation, UnsupportedConstructError
 from qcc.ir.ssa import (
@@ -60,7 +62,7 @@ _FLOAT_WORD_RE = re.compile(
 )
 _VECTOR_RE = re.compile(r"<\s*[0-9]+\s*x\s*[^>]+>")
 
-_BINARY_OPS = frozenset({"add", "sub", "and", "or", "xor"})
+_BINARY_OPS = frozenset({"add", "sub", "and", "or", "xor", "shl", "lshr", "ashr"})
 _CAST_OPS = frozenset({"zext", "sext", "trunc"})
 _ICMP_PREDICATES = frozenset(
     {"eq", "ne", "ugt", "uge", "ult", "ule", "sgt", "sge", "slt", "sle"}
@@ -88,9 +90,6 @@ _UNSUPPORTED_OPS = frozenset(
         "sdiv",
         "urem",
         "srem",
-        "shl",
-        "lshr",
-        "ashr",
         "extractvalue",
         "insertvalue",
         "extractelement",
@@ -408,6 +407,118 @@ def _extract_metadata(
     return instruction_text, tuple(attachments)
 
 
+def _llvm_string(value: str) -> str:
+    """Decode the small quoted-string subset used by LLVM debug metadata."""
+
+    try:
+        return bytes(value, "utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return value
+
+
+def _debug_locations(text: str, default_source: str) -> dict[int, SourceLocation]:
+    """Extract ``!dbg`` locations from Clang's line-tables-only metadata.
+
+    Debug metadata is intentionally parsed as a best-effort side table.  It is
+    not part of qcc's semantic LLVM subset, but it lets an unsupported IR
+    instruction point back to the original C file and line instead of an
+    implementation-detail line in the generated ``.ll`` text.
+    """
+
+    files: dict[int, str] = {}
+    scopes: dict[int, tuple[int, int | None]] = {}
+    for raw in text.splitlines():
+        file_match = re.match(
+            r"^!(\d+)\s*=\s*!DIFile\(.*?filename:\s*\"((?:\\.|[^\"])*)\""
+            r"(?:,\s*directory:\s*\"((?:\\.|[^\"])*)\")?",
+            raw,
+        )
+        if file_match is not None:
+            identifier = int(file_match.group(1))
+            filename = _llvm_string(file_match.group(2))
+            directory = _llvm_string(file_match.group(3) or "")
+            if not Path(filename).is_absolute() and directory:
+                filename = str(Path(directory) / filename)
+            files[identifier] = filename or default_source
+            continue
+        scope_match = re.match(
+            r"^!(\d+)\s*=\s*(?:distinct\s+)?!DISubprogram\(.*?"
+            r"file:\s*!(\d+)(?:.*?line:\s*(\d+))?",
+            raw,
+        )
+        if scope_match is not None:
+            scopes[int(scope_match.group(1))] = (
+                int(scope_match.group(2)),
+                int(scope_match.group(3)) if scope_match.group(3) else None,
+            )
+
+    locations: dict[int, SourceLocation] = {}
+    for scope_identifier, (_file_identifier, scope_line) in scopes.items():
+        if scope_line is not None:
+            locations[scope_identifier] = SourceLocation(default_source, scope_line, 1)
+    for raw in text.splitlines():
+        location_match = re.match(
+            r"^!(\d+)\s*=\s*(?:distinct\s+)?!DILocation\("
+            r".*?line:\s*(\d+),\s*column:\s*(\d+),\s*scope:\s*!(\d+)",
+            raw,
+        )
+        if location_match is None:
+            continue
+        identifier = int(location_match.group(1))
+        line = int(location_match.group(2))
+        column = int(location_match.group(3))
+        locations[identifier] = SourceLocation(default_source, line, column)
+    return locations
+
+
+def _location_from_dbg(
+    attachments: tuple[MetadataAttachment, ...],
+    fallback: SourceLocation,
+    locations: Mapping[int, SourceLocation] | None,
+) -> SourceLocation:
+    """Resolve the first ``!dbg`` attachment, if the side table has it."""
+
+    if locations is None:
+        return fallback
+    for attachment in attachments:
+        if attachment.name != "dbg":
+            continue
+        match = re.fullmatch(r"!(\d+)", attachment.node)
+        if match is not None and int(match.group(1)) in locations:
+            return locations[int(match.group(1))]
+    return fallback
+
+
+def _source_keyword_location(
+    source_name: str,
+    keywords: tuple[str, ...],
+    fallback: SourceLocation,
+    *,
+    after_line: int | None = None,
+) -> SourceLocation:
+    """Use a source declaration line when LLVM has no attachment for an op."""
+
+    if source_name in {"<llvm>", "<stdin>"}:
+        return fallback
+    try:
+        source_lines = Path(source_name).read_text().splitlines()
+    except OSError:
+        return fallback
+    for line_number, source_line in enumerate(source_lines, 1):
+        if after_line is not None and line_number <= after_line:
+            continue
+        for keyword in keywords:
+            pattern = (
+                rf"\b{re.escape(keyword)}\b"
+                if keyword.isidentifier()
+                else re.escape(keyword)
+            )
+            match = re.search(pattern, source_line)
+            if match is not None:
+                return SourceLocation(source_name, line_number, match.start() + 1)
+    return fallback
+
+
 def _operand(
     text: str,
     expected_type: IntType,
@@ -564,12 +675,17 @@ def _parse_instruction(
     values: dict[str, SSAValue],
     function_return_type: IntType | VoidType,
     forward_names: set[str] | None = None,
+    debug_locations: Mapping[int, SourceLocation] | None = None,
 ) -> Instruction:
     base, metadata = _extract_metadata(
         line.strip(),
         _location(source_name, line_number, line),
     )
-    location = _location(source_name, line_number, line)
+    location = _location_from_dbg(
+        metadata,
+        _location(source_name, line_number, line),
+        debug_locations,
+    )
     result_name: str | None = None
     result_match = re.match(r"^(%[^\s=]+)\s*=\s*(.+)$", base)
     if result_match is not None:
@@ -847,6 +963,12 @@ def _parse_instruction(
             metadata=metadata,
         )
 
+    if opcode == "alloca":
+        location = _source_keyword_location(
+            source_name,
+            ("volatile", "_Atomic", "atomic_"),
+            location,
+        )
     _unsupported_opcode(opcode, location)
     raise AssertionError("unreachable")
 
@@ -858,7 +980,6 @@ def _parse_parameters(
     line_number: int,
     location: SourceLocation,
 ) -> tuple[Parameter, ...]:
-    del source_name, line_number
     if not text.strip():
         return ()
     parameters: list[Parameter] = []
@@ -872,11 +993,21 @@ def _parse_parameters(
                 location,
             )
         if "*" in item or re.search(r"\bptr\b", item):
+            pointer_location = location
+            unresolved = "*" in item and "(" not in item
+            if unresolved:
+                pointer_location = _source_keyword_location(
+                    source_name,
+                    ("[", "->"),
+                    location,
+                    after_line=location.line,
+                )
             raise UnsupportedConstructError(
-                "pointer function parameter",
-                "pointer-typed function parameters are not supported in the "
-                "integer v0.1 subset",
-                location,
+                "unresolved pointer" if unresolved else "function pointer",
+                "unresolved pointers and variable-index memory access are not supported"
+                if unresolved
+                else "function pointers are not supported",
+                pointer_location,
             )
         type_match = re.search(
             r"(?<![A-Za-z0-9_])i[1-9][0-9]*(?![A-Za-z0-9_])",
@@ -925,6 +1056,7 @@ def _parse_function_header(
     *,
     source_name: str,
     line_number: int,
+    debug_locations: Mapping[int, SourceLocation] | None = None,
 ) -> tuple[
     str,
     IntType | VoidType,
@@ -932,7 +1064,13 @@ def _parse_function_header(
     tuple[str, ...],
     SourceLocation,
 ]:
-    location = _location(source_name, line_number, header)
+    header_location = _location(source_name, line_number, header)
+    _, header_metadata = _extract_metadata(header, header_location)
+    location = _location_from_dbg(header_metadata, header_location, debug_locations)
+    if location == header_location and debug_locations is not None:
+        debug_match = re.search(r"(?:,|\s)!dbg\s+!(\d+)", header)
+        if debug_match is not None:
+            location = debug_locations.get(int(debug_match.group(1)), location)
     if not header.rstrip().endswith("{"):
         raise LLVMParseError("function definition must open with '{'", location)
     content = header.rstrip()[:-1].rstrip()
@@ -1098,6 +1236,7 @@ def _parse_function(
     start: int,
     *,
     source_name: str,
+    debug_locations: Mapping[int, SourceLocation] | None = None,
 ) -> tuple[Function, int]:
     line_number = start + 1
     header = _strip_comment(lines[start]).strip()
@@ -1115,8 +1254,25 @@ def _parse_function(
             header,
             source_name=source_name,
             line_number=line_number,
+            debug_locations=debug_locations,
         )
     )
+    for body_line_index in range(cursor + 1, len(lines)):
+        body_line = _strip_comment(lines[body_line_index])
+        if body_line.strip() == "}":
+            break
+        if "!llvm.loop" in body_line:
+            loop_location = _location(source_name, body_line_index + 1, body_line)
+            _, loop_metadata = _extract_metadata(body_line, loop_location)
+            loop_location = _location_from_dbg(
+                loop_metadata, loop_location, debug_locations
+            )
+            raise UnsupportedConstructError(
+                "cyclic control flow",
+                "a surviving LLVM loop is data-dependent or was not fully "
+                "unrolled; use a statically bounded loop and enable full unrolling",
+                loop_location,
+            )
     values: dict[str, SSAValue] = {
         parameter.name: parameter for parameter in parameters
     }
@@ -1206,6 +1362,7 @@ def _parse_function(
             values=values,
             function_return_type=return_type,
             forward_names=forward_names,
+            debug_locations=debug_locations,
         )
         if instruction.opcode == "phi" and any(
             existing.opcode != "phi" for existing in instructions
@@ -1231,6 +1388,7 @@ def parse_module(text: str, source_name: str = "<llvm>") -> Module:
     # Run the lexical pass first so malformed quoting and locations are reported
     # consistently even for module-level constructs the line parser ignores.
     tokenize(text, source_name)
+    debug_locations = _debug_locations(text, source_name)
     lines = text.splitlines()
     functions: list[Function] = []
     module_metadata: list[str] = []
@@ -1244,7 +1402,12 @@ def parse_module(text: str, source_name: str = "<llvm>") -> Module:
             cursor += 1
             continue
         if stripped.startswith("define "):
-            function, cursor = _parse_function(lines, cursor, source_name=source_name)
+            function, cursor = _parse_function(
+                lines,
+                cursor,
+                source_name=source_name,
+                debug_locations=debug_locations,
+            )
             if any(existing.name == function.name for existing in functions):
                 raise LLVMParseError(
                     f"function @{function.name} is defined more than once",
@@ -1254,12 +1417,12 @@ def parse_module(text: str, source_name: str = "<llvm>") -> Module:
             functions.append(function)
             continue
         if stripped.startswith("declare "):
-            raise UnsupportedConstructError(
-                "function declaration",
-                "function declarations/calls are not supported in the "
-                "straight-line v0.1 subset",
-                _location(source_name, line_number, raw),
-            )
+            # External declarations are harmless until a supported function
+            # actually calls one.  The instruction-level diagnostic then points
+            # at the call site rather than at Clang's module preamble.
+            module_metadata.append(stripped)
+            cursor += 1
+            continue
         if stripped.startswith("target triple"):
             target_match = re.search(r'"(.*)"', stripped)
             if target_match:
@@ -1286,10 +1449,27 @@ def parse_module(text: str, source_name: str = "<llvm>") -> Module:
             r"^\$?[A-Za-z_.$][A-Za-z0-9_.$-]*\s*=",
             stripped,
         ):
+            if " constant " in f" {stripped} ":
+                module_metadata.append(stripped)
+                cursor += 1
+                continue
+            name_match = re.match(r"^@?([A-Za-z_.$][A-Za-z0-9_.$-]*)\s*=", stripped)
+            fallback = _location(source_name, line_number, raw)
+            if name_match and source_name not in {"<llvm>", "<stdin>"}:
+                try:
+                    source_lines = Path(source_name).read_text().splitlines()
+                except OSError:
+                    source_lines = []
+                needle = name_match.group(1).lstrip("@")
+                for source_line_number, source_line in enumerate(source_lines, 1):
+                    if re.search(rf"\b{re.escape(needle)}\b\s*=", source_line):
+                        fallback = SourceLocation(source_name, source_line_number, 1)
+                        break
             raise UnsupportedConstructError(
                 "global definition",
-                "global variables and global initializers are not supported in v0.1",
-                _location(source_name, line_number, raw),
+                "global mutable state, global variables, and global initializers "
+                "are not supported in v0.2",
+                fallback,
             )
         raise LLVMParseError(
             f"unrecognized top-level LLVM construct {stripped.split()[0]!r}",

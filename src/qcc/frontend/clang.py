@@ -30,6 +30,8 @@ _REQUIRED_FLAGS: tuple[str, ...] = (
     "-emit-llvm",
     "-fno-vectorize",
     "-fno-slp-vectorize",
+    "-funroll-loops",
+    "-gline-tables-only",
 )
 _OPTIONAL_PRESERVE_NAMES_FLAG = "-fno-discard-value-names"
 _DIAGNOSTIC_RE = re.compile(
@@ -121,6 +123,7 @@ def compile_c(
     source: SourceInput,
     *,
     source_name: str | None = None,
+    opt: int = 1,
     clang: str | os.PathLike[str] = "clang",
     extra_flags: Iterable[str] = (),
     timeout: float | None = 120.0,
@@ -152,7 +155,15 @@ def compile_c(
         input_argument = "-"
         stdin_text = source if isinstance(source, str) else os.fspath(source)
 
-    flags = [*_REQUIRED_FLAGS, _OPTIONAL_PRESERVE_NAMES_FLAG, *tuple(extra_flags)]
+    if opt < 0 or opt > 3:
+        raise ValueError("opt must be between 0 and 3")
+    optimization_flag = f"-O{max(1, opt)}"
+    flags = [
+        optimization_flag,
+        *tuple(flag for flag in _REQUIRED_FLAGS if not flag.startswith("-O")),
+        _OPTIONAL_PRESERVE_NAMES_FLAG,
+        *tuple(extra_flags),
+    ]
     base_command = [
         executable_path,
         *flags,
