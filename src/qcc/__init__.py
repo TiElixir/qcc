@@ -497,19 +497,32 @@ def _find_frontend_callable() -> Callable[..., Any]:
     )
 
 
-def compile_c(source_or_path: Any, function: str | None = "main", opt: int = 1) -> Any:
+def compile_c(
+    source_or_path: Any,
+    function: str | None = "main",
+    opt: int = 1,
+    *,
+    reuse_ancillas: bool | None = None,
+) -> Any:
     """Compile C source text or a C path into a reversible :class:`Circuit`.
 
     ``function`` selects the fixed-width SSA function emitted by the frontend;
-    ``opt`` is passed through as the frontend's optimization level.  The
-    frontend and netlist implementations are imported lazily so callers can
-    use the lowering package independently in tests.
+    ``opt`` is passed through as the frontend's optimization level.  Level 2
+    enables conservative clean-ancilla reuse unless ``reuse_ancillas`` is
+    explicitly supplied.  The frontend and netlist implementations are
+    imported lazily so callers can use the lowering package independently in
+    tests.
     """
 
     if _looks_like_circuit(source_or_path):
         return source_or_path
     if _looks_like_ssa(source_or_path):
-        lowered = lower_ssa(source_or_path, function_name=function)
+        lowered = lower_ssa(
+            source_or_path,
+            function_name=function,
+            optimization_level=opt,
+            reuse_ancillas=reuse_ancillas,
+        )
         return _construct_circuit(lowered)
     frontend = _find_frontend_callable()
     _, _, source_path = _source_and_path(source_or_path)
@@ -521,7 +534,12 @@ def compile_c(source_or_path: Any, function: str | None = "main", opt: int = 1) 
     selected = _select_function(frontend_result, function)
     if _looks_like_circuit(selected):
         return selected
-    lowered = lower_ssa(selected, function_name=function)
+    lowered = lower_ssa(
+        selected,
+        function_name=function,
+        optimization_level=opt,
+        reuse_ancillas=reuse_ancillas,
+    )
     return _construct_circuit(lowered)
 
 
