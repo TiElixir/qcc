@@ -3,7 +3,7 @@
 ## Scope
 
 qcc compiles a deliberately bounded, pure-C subset into reversible circuits.
-The first release optimizes for inspectable semantics and useful diagnostics,
+The first releases optimize for inspectable semantics and useful diagnostics,
 not source-language coverage. Clang is used as the C frontend, while the
 project owns the parser for the small textual LLVM IR subset it accepts.
 
@@ -20,10 +20,11 @@ C source
 
 Each arrow is a validation boundary. Unsupported syntax, types, opcodes, and
 control flow should produce an explicit diagnostic rather than being silently
-approximated. The v0.1 baseline is straight-line integer code. The v0.2
-sections below specify the control-flow and predicate extension; they are a
-semantic contract, not evidence that every v0.2 operation is already present
-in a particular checkout.
+approximated. The v0.1 baseline is straight-line integer code and v0.2 adds
+predicates, reversible control flow, and constant wiring. The v0.3 sections below
+specify arithmetic growth, MCX lowering, named QASM registers, and resource
+conventions. They are semantic and accounting contracts, not evidence that
+every v0.3 operation is already present or verified in a particular checkout.
 
 ## Frontend boundary
 
@@ -156,6 +157,72 @@ Constant wiring does not make signed C right shift portable: the source
 contract accepts only the explicitly documented fixed-width semantics, while
 `ashr` is the two's-complement sign-fill operation in normalized IR.
 
+## v0.3 arithmetic
+
+The v0.3 arithmetic operations use explicit fixed-width bit-vector semantics.
+For an `n`-bit value, an unsigned result is reduced modulo `2**n`; operands
+remain available to the caller unless an operation is explicitly documented
+as an in-place target update. A pure function returning an arithmetic result
+uses a clean output register, and all work registers are restored before the
+function finishes.
+
+### Multiplication
+
+`mul` is fixed-width modular multiplication. For same-width operands `a` and
+`b`, the observable result is:
+
+```text
+mul_n(a, b) = (a * b) mod 2**n
+```
+
+The baseline reversible schedule preserves both inputs, forms controlled
+partial products with the multiplier bits, and accumulates them with modular
+adders. Partial products that fall outside the result width are discarded as
+part of the modulo operation; they are not silently saturated. The reference
+implementation may use a clean `n`-bit accumulator plus carry/work bits, with
+the accumulator copied to the output and all partial-product work uncomputed.
+This is an `O(n**2)` baseline in controlled-adder work. Exact X/CX/CCX counts
+depend on the chosen adder schedule and must be reported from the emitted
+circuit when available.
+
+The public source example is unsigned fixed-width multiplication. A signed
+source operation is accepted only if its normalized IR semantics are in the
+documented defined subset; signed overflow is never given a reversible meaning
+by qcc.
+
+### Constant restoring division and remainder
+
+The supported division family has an unsigned, compile-time nonzero divisor.
+For `n`-bit `x` and a constant `d` with `1 <= d < 2**n`, the results are:
+
+```text
+udiv_n(x, d) = floor(x / d)
+urem_n(x, d) = x mod d
+```
+
+The divisor is a classical constant, not a runtime quantum register. A
+restoring schedule scans the dividend from the most significant bit to the
+least significant bit. Each iteration shifts the partial remainder, compares
+it with `d`, conditionally subtracts `d`, and records one quotient bit. The
+compare/subtract decision is then uncomputed as part of the cleanup schedule.
+The quotient and remainder can share the same restoring work; a public
+single-result operation copies either selected result to its clean output.
+
+The reversible mapping for a result register is conceptually:
+
+```text
+|x>|0_result>|0_work> -> |x>|udiv_n(x, d)>|0_work>
+|x>|0_result>|0_work> -> |x>|urem_n(x, d)>|0_work>
+```
+
+The baseline uses `n` restoring iterations, each with linear-width comparison
+and subtraction work, so its planning cost is `O(n**2)` primitive work. It
+does not claim a fixed gate count: carry direction, comparator choice, output
+copy, and uncompute order are part of the selected lowering schedule. A
+runtime divisor, a zero divisor, and signed division/remainder are outside
+this contract. Division by zero is rejected before lowering because the C
+source operation is undefined; qcc does not invent quotient or remainder bits.
+
 ## Loop-unroll policy
 
 The frontend may accept a source loop only when it can prove a finite,
@@ -192,6 +259,28 @@ These figures are planning costs, not claims about completed implementation
 or test output. Resource reports must count any actual copy, fill, predicate,
 and cleanup gates emitted by the selected lowering schedule.
 
+## MCX decomposition policy
+
+MCX is an intermediate logical gate, not an OpenQASM 3 primitive in the qcc
+backend. Every multi-controlled X must be expanded to `X`, `CX`, and `CCX`
+before QASM emission or before a primitive resource report is treated as
+final. The baseline policy is deterministic and uses clean ancillas:
+
+- Zero controls are `X`; one control is `CX`; two controls are `CCX`.
+- For `k >= 3` controls, allocate `k - 2` clean ancillas. Compute the
+  conjunction of the controls into a Toffoli ladder, apply one `CCX` to the
+  final conjunction and target, and reverse the ladder.
+- The clean-ancilla ladder therefore uses `2k - 3` `CCX` gates for `k >= 2`
+  controls (with the `k = 2` case being the direct one-`CCX` base case) and
+  returns every decomposition ancilla to zero.
+- Ancilla-free, relative-phase, dirty-ancilla, and hardware-specific MCX
+  decompositions are optimizer or backend policies outside this baseline.
+
+The decomposition must preserve control and target wires, must not measure or
+discard a control, and must be applied before the OpenQASM 3 emitter sees the
+circuit. A resource report may expose both the logical `mcx` count and the
+post-decomposition primitive count, but it must label which layer it reports.
+
 ## Reversibility and cleanup
 
 Computations are built out of clean ancillas. A temporary is computed, copied
@@ -205,6 +294,69 @@ This baseline may use more gates or ancillas than an optimized implementation,
 but it supplies a simple correctness reference. Later optimizer work may
 reduce gate count or reuse clean ancillas only if it preserves the same
 observable mapping and cleanup invariant.
+
+## OpenQASM 3 register mapping
+
+The OpenQASM 3 backend maps the logical circuit layout to named quantum
+registers in declared layout order. Each register is emitted as
+`qubit[n] name;`; register names must be valid OpenQASM identifiers and sizes
+must be positive. Inputs, outputs, and clean ancillas remain distinct named
+registers when the layout exposes them. The backend emits no measurements or
+classical registers.
+
+Logical bit `i` of a named `n`-bit register is emitted as `name[i]`. This is a
+little-endian convention: bit zero is the least significant bit and is the
+first element of the register's logical bit sequence. For a non-contiguous
+physical layout, the layout's ordered bit list defines the mapping; physical
+indices are not used as OpenQASM array indices by accident. Every gate operand
+must resolve through that map and must be in range.
+
+The emitted primitive subset is:
+
+```qasm
+OPENQASM 3.0;
+include "stdgates.inc";
+qubit[n] input;
+qubit[m] output;
+qubit[k] ancilla;
+// x, cx, and ccx instructions follow
+```
+
+The emitter validates the header, include, declarations, gate arity, named
+register references, and index ranges. MCX is an error at this boundary if it
+has not already been decomposed. OpenQASM text is therefore a serialization
+of a validated primitive circuit, not a place where unsupported operations are
+silently approximated.
+
+## Resource and T-count estimate conventions
+
+Resource reports and planning estimates use separate, explicitly labelled
+layers:
+
+1. **Logical layer:** counts source-level arithmetic blocks and any `mcx`
+   operations before decomposition.
+2. **Primitive layer:** counts emitted `X`, `CX`, and `CCX` gates after MCX
+   expansion. It includes output copies, predicate/quotient/remainder work,
+   and all compute/uncompute gates. It excludes no cleanup merely because the
+   cleanup is an inverse schedule.
+3. **T estimate:** estimates the Clifford+T cost from the primitive layer.
+
+The standard baseline convention is an exact Toffoli decomposition with
+`T-count(CCX) = 7`, `T-count(X) = 0`, and `T-count(CX) = 0`; both `T` and
+`T-dagger` count as one T gate. Under this convention, an MCX with `k >= 2`
+controls contributes `7 * (2k - 3)` estimated T gates, while zero and one
+control contribute zero T gates. A backend that uses a different exact or
+relative-phase decomposition must report its own convention instead of
+silently reusing this estimate.
+
+`qubit_count` includes inputs, outputs, and allocated clean ancillas;
+`ancillas` is the peak number of clean work qubits in the selected layout;
+`gate_count` is the number of operations in the layer being reported; and
+`depth` is the sequential layer count where gates sharing a qubit cannot be
+placed in the same layer. A T estimate is not a measured hardware runtime or
+fidelity prediction. Until a v0.3 implementation emits and records these
+layers, the formulas above are planning conventions rather than acceptance
+results.
 
 ## Outputs and validation
 

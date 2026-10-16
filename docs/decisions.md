@@ -122,3 +122,32 @@ Signed `icmp` predicates interpret each fixed-width operand as an `n`-bit
 two's-complement value. This signed comparison rule does not make
 signed-overflow arithmetic defined or expand support for general signed
 arithmetic.
+
+## D-011 — reject zero divisors
+
+**Status:** accepted
+
+Constant `udiv` and `urem` require a compile-time nonzero divisor. A zero
+divisor is rejected before lowering because C defines division by zero as
+undefined; qcc does not assign an arbitrary quotient, remainder, or reversible
+mapping to it.
+
+## D-012 — decompose MCX with a clean-ancilla Toffoli ladder
+
+**Status:** accepted
+
+MCX is an intermediate logical operation only. Before primitive resource
+reporting or OpenQASM 3 emission, qcc uses the deterministic clean-ancilla
+ladder: direct `X`/`CX`/`CCX` for zero, one, and two controls, and `k - 2`
+clean ancillas plus `2k - 3` `CCX` gates for `k >= 3`. The ladder is reversed
+to restore every ancilla. Ancilla-free, dirty-ancilla, and relative-phase
+decompositions are not the v0.3 baseline.
+
+## D-013 — keep Qiskit optional
+
+**Status:** accepted
+
+The compiler core, classical simulator, resource reports, OpenQASM 3 emitter,
+and validator remain standard-library-only. Qiskit is an optional extra for
+host-side integration and demonstrations; installing it is never required for
+the qcc quickstart or for the compiler's correctness checks.

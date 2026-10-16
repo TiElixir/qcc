@@ -1,13 +1,14 @@
 # Supported C subset
 
-This document is the authoritative source-level contract for qcc v0.2. It
+This document is the authoritative source-level contract for qcc v0.3. It
 covers the constructs that may be lowered after Clang emits normalized textual
-LLVM IR. The v0.2 contract is deliberately narrower than C: a construct is
-supported only when its generated IR satisfies the value, CFG, and cleanup
-rules below. A v0.2 design entry is not by itself a claim that the current
-checkout has finished implementing that construct.
+LLVM IR. The v0.3 contract is deliberately narrower than C: a construct is
+supported only when its generated IR satisfies the value, CFG, arithmetic, and
+cleanup rules below. A v0.3 design entry is a target contract, not by itself a
+claim that the current checkout has finished implementing that construct or
+passed its acceptance checks.
 
-## Supported in v0.2
+## Supported in v0.3
 
 ### Function and value model
 
@@ -24,12 +25,15 @@ checkout has finished implementing that construct.
 
 ### Integer expressions
 
-The v0.2 lowering contract covers these operations when widths and operands are
+The v0.3 lowering contract covers these operations when widths and operands are
 valid:
 
 - Integer constants and function arguments.
 - Addition and subtraction (`+`, `-`) with the documented fixed-width modulo
   behavior for accepted IR.
+- Same-width fixed-width multiplication (`mul`). The result is reduced modulo
+  `2**width`, and the reversible lowering preserves the operands while it
+  computes the result into a clean output/work register.
 - Bitwise AND, OR, XOR, and complement (`&`, `|`, `^`, `~`) including the
   canonical LLVM representation of complement.
 - Zero extension, sign extension, and truncation (`zext`, `sext`, `trunc`) with
@@ -46,6 +50,10 @@ valid:
 - Constant-count rotates represented by a recognized fixed-width rotate idiom
   or frontend operation. The count is reduced modulo the operand width; a
   variable rotate is not supported.
+- Unsigned division and remainder by a compile-time nonzero constant. The
+  normalized operations are `udiv` and `urem`, the divisor is represented at
+  the operation width, and the restoring schedule computes `floor(x / d)` or
+  `x % d` for `1 <= d < 2**width`.
 - Returning a supported integer value.
 
 ### Control flow and SSA
@@ -62,9 +70,9 @@ valid:
 - A source conditional expression may lower to `select` instead of a branch;
   both forms use the same reversible predicate and mux semantics.
 
-## Unsupported in v0.2
+## Unsupported in v0.3
 
-The following constructs are outside the authoritative v0.2 contract and must
+The following constructs are outside the authoritative v0.3 contract and must
 be rejected:
 
 - Runtime, data-dependent, or partially unrolled loops; any CFG cycle,
@@ -74,15 +82,27 @@ be rejected:
 - Variable shifts and rotates, shift counts outside the operand width, and
   source signed-right-shift forms whose result depends on implementation-
   defined C behavior.
-- Multiplication, division, remainder, floating-point arithmetic, vectors,
-  atomics, and compiler extensions that change the fixed-width contract.
+- Runtime/general division and remainder, including `x / y` or `x % y` when
+  the divisor is not a compile-time constant. qcc does not lower a
+  data-dependent divisor.
+- Signed division and signed remainder (`sdiv`, `srem`, or signed C `/` and
+  `%`) even when the divisor is a constant. Signed quotient/remainder sign
+  restoration and the C `INT_MIN / -1` overflow case are outside this
+  v0.3 contract.
+- Zero-divisor division or remainder, even if written as a constant. C makes
+  this operation undefined, so qcc rejects it rather than choosing quotient or
+  remainder bits.
+- Floating-point arithmetic, vectors, atomics, and compiler extensions that
+  change the fixed-width contract.
 - Pointers, arrays, structs, unions, `volatile` access, loads, stores, address
   calculations, dynamic allocation, and global state.
 - Function calls, recursion, function pointers, inline assembly, I/O, and
   other observable side effects.
 - Signed arithmetic whose C result can depend on overflow. Signed comparisons
   are supported as specified above; that exception does not make signed
-  addition, subtraction, or other arithmetic generally portable.
+  addition, subtraction, multiplication, division, or remainder generally
+  portable. In particular, signed division/remainder remain unsupported as a
+  family.
 - Multiple return values or return types, void-producing public functions,
   malformed SSA, or a phi with a missing or ambiguously duplicated edge value.
   Operands with mismatched or inferred widths are also rejected.
@@ -90,9 +110,12 @@ be rejected:
 Clang may lower a source construct into a different LLVM shape. The normalized
 LLVM IR is the validator's source of truth: qcc accepts a source program only
 when that shape is in the supported list, and it never skips an unrecognized
-instruction because the original C looked harmless. The current v0.1
-straight-line implementation remains the practical boundary until the v0.2
-items are implemented and their acceptance checks are recorded.
+instruction because the original C looked harmless. The current v0.2
+implementation remains the practical boundary in a checkout that has not
+integrated the v0.3 arithmetic and backend work. The v0.3 items
+above become practical support only after implementation and acceptance checks
+are recorded; this document does not turn a target operation into a verified
+result.
 
 ## Diagnostic policy
 
