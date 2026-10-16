@@ -25,6 +25,14 @@ from qcc.ir.netlist import (
     QubitAllocator,
     ResourceCounts,
 )
+from qcc.opt.gates import (
+    normalize_level,
+    optimize,
+    optimize_circuit,
+    optimize_gates,
+    optimizer_enabled,
+)
+from qcc.opt.ssa import constant_fold, dead_value_eliminate, optimize_ssa
 
 from .backend.report import ResourceReport, resource_report
 from .lower.ancilla import CircuitLayout as _LoweringCircuitLayout
@@ -500,29 +508,49 @@ def _find_frontend_callable() -> Callable[..., Any]:
 def compile_c(source_or_path: Any, function: str | None = "main", opt: int = 1) -> Any:
     """Compile C source text or a C path into a reversible :class:`Circuit`.
 
-    ``function`` selects the fixed-width SSA function emitted by the frontend;
-    ``opt`` is passed through as the frontend's optimization level.  The
-    frontend and netlist implementations are imported lazily so callers can
-    use the lowering package independently in tests.
+    ``function`` selects the fixed-width SSA function emitted by the frontend.
+    Levels zero and one retain the v0.3 circuit stream; levels two and three
+    run the v0.4 SSA and gate passes after frontend/lowering work completes.
+    The frontend and netlist implementations are imported lazily so callers
+    can use the lowering package independently in tests.
     """
 
+    normalized_opt = normalize_level(opt)
+    enabled = optimizer_enabled(normalized_opt)
     if _looks_like_circuit(source_or_path):
+        if enabled and isinstance(source_or_path, Circuit):
+            return optimize_circuit(source_or_path, normalized_opt)
         return source_or_path
     if _looks_like_ssa(source_or_path):
-        lowered = lower_ssa(source_or_path, function_name=function)
-        return _construct_circuit(lowered)
+        selected_ssa = (
+            optimize_ssa(source_or_path, normalized_opt) if enabled else source_or_path
+        )
+        lowered = lower_ssa(selected_ssa, function_name=function)
+        circuit = _construct_circuit(lowered)
+        return (
+            optimize_circuit(circuit, normalized_opt)
+            if enabled and isinstance(circuit, Circuit)
+            else circuit
+        )
     frontend = _find_frontend_callable()
     _, _, source_path = _source_and_path(source_or_path)
     source_name = str(source_path) if source_path is not None else "<stdin>"
     frontend_result = _materialize_frontend_result(
-        _invoke_frontend(frontend, source_or_path, function, opt),
+        _invoke_frontend(frontend, source_or_path, function, normalized_opt),
         source_name=source_name,
     )
     selected = _select_function(frontend_result, function)
     if _looks_like_circuit(selected):
+        if enabled and isinstance(selected, Circuit):
+            return optimize_circuit(selected, normalized_opt)
         return selected
+    if enabled:
+        selected = optimize_ssa(selected, normalized_opt)
     lowered = lower_ssa(selected, function_name=function)
-    return _construct_circuit(lowered)
+    circuit = _construct_circuit(lowered)
+    if enabled and isinstance(circuit, Circuit):
+        return optimize_circuit(circuit, normalized_opt)
+    return circuit
 
 
 def _input_values(circuit: Any, inputs: Any) -> dict[str, int]:
@@ -661,6 +689,13 @@ __all__ = [
     "SSAFormatError",
     "UnsupportedSSAOperation",
     "compile_c",
+    "constant_fold",
+    "dead_value_eliminate",
+    "normalize_level",
+    "optimize",
+    "optimize_circuit",
+    "optimize_gates",
+    "optimize_ssa",
     "lower_ssa",
     "resource_report",
     "simulate",

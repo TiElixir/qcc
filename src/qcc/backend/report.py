@@ -31,14 +31,27 @@ class ResourceReport:
     toffoli_estimate: int = -1
     mcx: int = 0
     mcx_cnot: int = 0
+    optimizer: int | None = None
 
     def __post_init__(self) -> None:
         estimate = self.toffoli if self.toffoli_estimate < 0 else self.toffoli_estimate
         t_count = 7 * estimate if self.t_count < 0 else self.t_count
         if estimate < 0 or t_count < 0:
             raise ValueError("resource estimates cannot be negative")
+        if self.optimizer is not None and (
+            isinstance(self.optimizer, bool)
+            or not isinstance(self.optimizer, int)
+            or self.optimizer < 0
+        ):
+            raise ValueError("optimizer level must be a non-negative integer")
         object.__setattr__(self, "toffoli_estimate", estimate)
         object.__setattr__(self, "t_count", t_count)
+
+    @property
+    def optimization_level(self) -> int | None:
+        """The optimizer level recorded on the source circuit, if any."""
+
+        return self.optimizer
 
     @property
     def num_qubits(self) -> int:
@@ -144,6 +157,8 @@ class ResourceReport:
                     "t_count": self.t_count,
                 }
             )
+        if self.optimizer is not None:
+            legacy["optimizer"] = self.optimizer
         return legacy
 
 
@@ -256,6 +271,15 @@ def _ancilla_count(circuit: Any) -> int:
     return 0
 
 
+def _optimizer_level(circuit: Any) -> int | None:
+    value = _attribute(circuit, ("optimization_level", "optimizer", "opt_level"), None)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def _depth(gates: Iterable[Any]) -> int:
     last_layer: dict[int, int] = {}
     depth = 0
@@ -268,7 +292,7 @@ def _depth(gates: Iterable[Any]) -> int:
     return depth
 
 
-def resource_report(circuit: Any) -> ResourceReport:
+def resource_report(circuit: Any, *, optimizer: int | None = None) -> ResourceReport:
     """Return resource counts without requiring a specific netlist class."""
 
     gates = _gates(circuit)
@@ -300,6 +324,7 @@ def resource_report(circuit: Any) -> ResourceReport:
         toffoli_estimate=toffoli_estimate,
         mcx=mcx_count,
         mcx_cnot=mcx_cnot,
+        optimizer=_optimizer_level(circuit) if optimizer is None else optimizer,
     )
 
 
