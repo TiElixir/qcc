@@ -1,9 +1,18 @@
 #include <stdint.h>
 
 /*
- * A small bit-flip oracle: applying it twice restores the input.  A host
- * Grover driver can use the returned mask as the oracle work register.
+ * The demo motivates the search with
+ *
+ *     (x * x + 3) % 17 == 5.
+ *
+ * On the three-bit domain [0, 7] this predicate has the single solution
+ * x == 6.  qcc v0.2 deliberately does not lower multiplication or remainder,
+ * so the selected entry point below spells the equivalent bounded predicate
+ * using the supported equality operation.
  */
-uint8_t grover_oracle(uint8_t x) {
-    return (uint8_t)(x ^ (uint8_t)0x2a);
+typedef unsigned _BitInt(3) grover_input_t;
+typedef unsigned _BitInt(1) grover_output_t;
+
+grover_output_t grover_oracle(grover_input_t x) {
+    return x == 6;
 }
