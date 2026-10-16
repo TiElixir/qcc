@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling>=1.18,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qcc"
+version = "0.1.0"
+description = "A deliberately bounded C-to-reversible-circuit compiler."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "qcc contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Compilers",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis>=6.92",
+  "mypy>=1.7",
+  "pytest>=7.4",
+  "ruff>=0.6",
+]
+qiskit = ["qiskit>=1.0"]
+
+[project.scripts]
+qcc = "qcc.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qcc"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/docs",
+  "/LICENSE",
+  "/README.md",
+  "/pyproject.toml",
+  "/src",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src"]
+pretty = true
+show_error_codes = true
