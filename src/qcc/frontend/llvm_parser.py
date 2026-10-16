@@ -325,13 +325,15 @@ def _parse_type(value: str, location: SourceLocation) -> IntType:
         if _FLOAT_WORD_RE.search(value) or value.strip() in {"float", "double"}:
             raise UnsupportedConstructError(
                 "floating-point type",
-                "floating-point values are not supported; qcc v0.1 accepts integer types only",
+                "floating-point values are not supported; qcc v0.1 accepts "
+                "integer types only",
                 location,
             )
         if _VECTOR_RE.search(value):
             raise UnsupportedConstructError(
                 "vector type",
-                "vector types are not supported; qcc v0.1 accepts scalar integer types only",
+                "vector types are not supported; qcc v0.1 accepts scalar "
+                "integer types only",
                 location,
             )
         raise LLVMParseError(f"expected an integer type, got {value!r}", location)
@@ -446,7 +448,8 @@ def _operand(
     if _FLOAT_WORD_RE.search(value) or re.search(r"[0-9]\.[0-9]", value):
         raise UnsupportedConstructError(
             "floating-point constant",
-            "floating-point values are not supported; qcc v0.1 accepts integer constants only",
+            "floating-point values are not supported; qcc v0.1 accepts "
+            "integer constants only",
             location,
         )
     if _INTEGER_RE.fullmatch(value):
@@ -477,7 +480,8 @@ def _result(
 def _unsupported_opcode(opcode: str, location: SourceLocation) -> None:
     if opcode in _CONTROL_FLOW_OPS:
         message = (
-            f"unsupported LLVM instruction {opcode!r}; branches, multiple basic blocks, "
+            f"unsupported LLVM instruction {opcode!r}; branches, multiple "
+            "basic blocks, "
             "and cyclic control flow are not supported in v0.1"
         )
     elif opcode in _MEMORY_OPS:
@@ -487,7 +491,8 @@ def _unsupported_opcode(opcode: str, location: SourceLocation) -> None:
         )
     elif opcode == "call" or opcode.endswith("call"):
         message = (
-            f"unsupported LLVM instruction {opcode!r}; function calls are not supported "
+            f"unsupported LLVM instruction {opcode!r}; function calls are not "
+            "supported "
             "in the straight-line v0.1 subset"
         )
     elif opcode in _UNSUPPORTED_OPS:
@@ -495,7 +500,8 @@ def _unsupported_opcode(opcode: str, location: SourceLocation) -> None:
     else:
         raise UnsupportedConstructError(
             f"unknown LLVM instruction {opcode!r}",
-            f"unknown LLVM instruction {opcode!r}; the parser will not skip unsupported instructions",
+            f"unknown LLVM instruction {opcode!r}; the parser will not skip "
+            "unsupported instructions",
             location,
         )
     raise UnsupportedConstructError(f"LLVM instruction {opcode!r}", message, location)
@@ -659,7 +665,8 @@ def _parse_instruction(
             )
         if return_type != function_return_type:
             raise LLVMParseError(
-                f"return type {return_type} does not match function return type {function_return_type}",
+                f"return type {return_type} does not match function return type "
+                f"{function_return_type}",
                 location,
             )
         return Instruction(
@@ -697,7 +704,8 @@ def _parse_parameters(
         if "*" in item or re.search(r"\bptr\b", item):
             raise UnsupportedConstructError(
                 "pointer function parameter",
-                "pointer-typed function parameters are not supported in the integer v0.1 subset",
+                "pointer-typed function parameters are not supported in the "
+                "integer v0.1 subset",
                 location,
             )
         type_match = re.search(
@@ -893,7 +901,8 @@ def _parse_function(
             if saw_label:
                 raise UnsupportedConstructError(
                     "multiple basic blocks",
-                    "multiple basic blocks and branches/cycles are not supported in v0.1",
+                    "multiple basic blocks and branches/cycles are not supported "
+                    "in v0.1",
                     _location(source_name, current_line, current),
                 )
             saw_label = True
@@ -956,7 +965,8 @@ def parse_module(text: str, source_name: str = "<llvm>") -> Module:
         if stripped.startswith("declare "):
             raise UnsupportedConstructError(
                 "function declaration",
-                "function declarations/calls are not supported in the straight-line v0.1 subset",
+                "function declarations/calls are not supported in the "
+                "straight-line v0.1 subset",
                 _location(source_name, line_number, raw),
             )
         if stripped.startswith("target triple"):

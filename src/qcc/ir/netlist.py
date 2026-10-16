@@ -107,10 +107,7 @@ def _normalize_qubits(
     else:
         try:
             # A single integer is one operand; a Qubit is also an integer.
-            if isinstance(values, int):
-                raw = (values,)
-            else:
-                raw = tuple(values)  # type: ignore[arg-type]
+            raw = (values,) if isinstance(values, int) else tuple(values)  # type: ignore[arg-type]
         except TypeError:
             raw = (values,)
     result = tuple(
@@ -368,7 +365,8 @@ class CircuitLayout:
             name: tuple(map(int, bits)) for name, bits in self.registers.items()
         }
         return (
-            f"CircuitLayout(registers={registers!r}, ancillas={tuple(map(int, self.ancillas))!r}, "
+            f"CircuitLayout(registers={registers!r}, "
+            f"ancillas={tuple(map(int, self.ancillas))!r}, "
             f"num_qubits={self.num_qubits})"
         )
 
@@ -543,10 +541,7 @@ class Circuit:
         max_gate_qubit = max(
             (int(q) for gate in gate_tuple for q in gate.qubits), default=-1
         )
-        if layout is not None:
-            inferred_width = layout.num_qubits
-        else:
-            inferred_width = max_gate_qubit + 1
+        inferred_width = layout.num_qubits if layout is not None else max_gate_qubit + 1
         if num_qubits is None:
             width = inferred_width
         else:
@@ -731,7 +726,10 @@ class Circuit:
         return CircuitBuilder.from_circuit(self)
 
     def pretty(self) -> str:
-        header = f"Circuit(qubits={self.num_qubits}, gates={len(self.gates)}, depth={self.depth})"
+        header = (
+            f"Circuit(qubits={self.num_qubits}, gates={len(self.gates)}, "
+            f"depth={self.depth})"
+        )
         if not self.gates:
             return header
         lines = [header]

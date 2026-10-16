@@ -243,7 +243,7 @@ def copy_register(
     dst = _register(target, "target")
     _same_width(src, dst)
     _disjoint(src, dst)
-    for source_bit, target_bit in zip(src, dst):
+    for source_bit, target_bit in zip(src, dst, strict=False):
         builder.cx(source_bit, target_bit)
     return builder
 
@@ -265,7 +265,7 @@ def controlled_xor(
     control_bit = _one_qubit(control, "control")
     _same_width(src, dst)
     _disjoint((control_bit,), src, dst)
-    for source_bit, target_bit in zip(src, dst):
+    for source_bit, target_bit in zip(src, dst, strict=False):
         builder.ccx(control_bit, source_bit, target_bit)
     return builder
 

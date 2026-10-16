@@ -154,7 +154,7 @@ def copy_bits(
     """XOR ``source`` into a zero or existing target register."""
 
     _check_target_width(source, target)
-    for source_bit, target_bit in zip(source, target):
+    for source_bit, target_bit in zip(source, target, strict=False):
         if source_bit != target_bit:
             emitter.cx(source_bit, target_bit)
 
@@ -177,7 +177,9 @@ def and_bits(
 
     _check_same_width(first, second, "and")
     _check_same_width(first, target, "and")
-    for first_bit, second_bit, target_bit in zip(first.bits, second.bits, target.bits):
+    for first_bit, second_bit, target_bit in zip(
+        first.bits, second.bits, target.bits, strict=True
+    ):
         if first_bit == second_bit:
             if first_bit != target_bit:
                 emitter.cx(first_bit, target_bit)
@@ -192,7 +194,9 @@ def or_bits(
 
     _check_same_width(first, second, "or")
     _check_same_width(first, target, "or")
-    for first_bit, second_bit, target_bit in zip(first.bits, second.bits, target.bits):
+    for first_bit, second_bit, target_bit in zip(
+        first.bits, second.bits, target.bits, strict=True
+    ):
         if first_bit == second_bit:
             if first_bit != target_bit:
                 emitter.cx(first_bit, target_bit)

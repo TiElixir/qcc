@@ -208,7 +208,7 @@ def _invoke_compiler(args: argparse.Namespace, source: Path) -> Any:
         try:
             return compiler(str(source))
         except TypeError:
-            raise exc
+            raise exc from None
 
 
 def _result_part(result: Any, names: Sequence[str], default: Any = None) -> Any:
@@ -421,10 +421,10 @@ def _write_output(text: str, destination: str | None) -> None:
 
 def _emit_qasm(circuit: Any) -> str:
     try:
-        from qcc.backend.qasm3 import emit_qasm3  # type: ignore[import-not-found]
+        from qcc.backend.qasm3 import emit_qasm3
     except ImportError as exc:
         raise CLIError("the OpenQASM 3 backend is unavailable") from exc
-    return cast(str, emit_qasm3(circuit))
+    return emit_qasm3(circuit)
 
 
 def _emit_for_command(args: argparse.Namespace, result: Any, circuit: Any) -> str:

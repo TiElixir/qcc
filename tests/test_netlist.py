@@ -1,4 +1,5 @@
 import pytest
+
 from qcc import CircuitBuilder, CircuitLayout, Gate, QubitAllocator
 from qcc.sim.classical import (
     AncillaDirtyError,

@@ -1,14 +1,14 @@
 """Public qcc compiler pipeline and reversible-circuit building blocks."""
 
-from qcc.ir.netlist import (
-    Circuit,
-    CircuitBuilder,
-    CircuitLayout,
-    Gate,
-    Qubit,
-    QubitAllocator,
-    ResourceCounts,
-)
+from __future__ import annotations
+
+import importlib
+import inspect
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
 from qcc.errors import (
     ClangCompilationError,
     ClangNotFoundError,
@@ -18,15 +18,13 @@ from qcc.errors import (
     SourceLocation,
     UnsupportedConstructError,
 )
-
-from __future__ import annotations
-
-import importlib
-import inspect
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, cast
+from qcc.ir.netlist import (
+    CircuitBuilder,
+    Gate,
+    Qubit,
+    QubitAllocator,
+    ResourceCounts,
+)
 
 from .backend.report import ResourceReport, resource_report
 from .lower.ancilla import CircuitLayout as _LoweringCircuitLayout
@@ -87,7 +85,8 @@ class _FallbackCircuit:
         return _simulate_gate_stream(self, inputs)
 
 
-_netlist_module, Circuit, _BaseCircuitLayout = _load_netlist()
+_netlist_module, _circuit_type, _BaseCircuitLayout = _load_netlist()
+Circuit: Any = _circuit_type
 
 
 if _netlist_module is not None and hasattr(_BaseCircuitLayout, "registers"):
@@ -410,10 +409,7 @@ def _invoke_frontend(
         name = parameter.name.lower()
         value: Any
         if name in {"source_or_path", "source_path", "input_path", "path", "filename"}:
-            if path is not None:
-                value = path
-            else:
-                value = source_value
+            value = path if path is not None else source_value
             if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
                 positional.append(value)
             else:
@@ -532,7 +528,7 @@ def _input_values(circuit: Any, inputs: Any) -> dict[str, int]:
             raise ValueError(
                 f"expected {len(names)} input register values, got {len(values)}"
             )
-        return {name: int(value) for name, value in zip(names, values)}
+        return {name: int(value) for name, value in zip(names, values, strict=True)}
     raise TypeError(
         "inputs must be a mapping, a register-value sequence, or an integer"
     )

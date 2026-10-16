@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from itertools import product
 
 import pytest
+
 from qcc.backend.qasm3 import UnsupportedGateError, emit_qasm3
 
 

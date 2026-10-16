@@ -138,10 +138,7 @@ def _field(value: Any, names: Sequence[str], default: Any = None) -> Any:
 def _normalise_name(value: Any) -> str | None:
     if value is None:
         return None
-    if isinstance(value, str):
-        text = value.strip()
-    else:
-        text = str(value).strip()
+    text = value.strip() if isinstance(value, str) else str(value).strip()
     if not text:
         return None
     text = text.removeprefix("%")
