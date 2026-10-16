@@ -151,3 +151,53 @@ The compiler core, classical simulator, resource reports, OpenQASM 3 emitter,
 and validator remain standard-library-only. Qiskit is an optional extra for
 host-side integration and demonstrations; installing it is never required for
 the qcc quickstart or for the compiler's correctness checks.
+
+## D-014 — define v0.4 optimization levels as semantics-preserving schedules
+
+**Status:** accepted for the v0.4 release contract
+
+The public optimizer levels are O0, O1, and O2. O0 is the deterministic v0.3
+Bennett baseline. O1 adds defined SSA simplification and local reversible-gate
+peepholes. O2 adds path-aware lifetime-based eager uncomputation and clean
+ancilla reuse when its proof obligations are discharged. A level is an allowed
+pass set, not a promise of fewer gates, qubits, depth, or T gates; O2 may produce
+the O1 or O0 circuit. Levels above O2 have no v0.4 semantics.
+
+The qcc optimization contract applies after normalized SSA validation. It is
+separate from any Clang optimization used to obtain stable textual LLVM, and it
+does not widen the supported source subset or assign meaning to undefined
+behavior.
+
+## D-015 — require proof obligations for eager cleanup and ancilla reuse
+
+**Status:** accepted for the v0.4 release contract
+
+A temporary may be eagerly uncomputed only after its last use on every reachable
+path and by inverting the exact verified compute schedule. An ancilla may be
+reused only when it is clean at acquisition, exclusive of all live values and
+pending inverses, restored on every path, disjoint from inputs/outputs and gate
+operands, and covered by observable-equivalence and clean-workspace evidence.
+Unknown aliasing, edge identity, path cleanup, phase, or layout facts retain the
+baseline schedule and fresh workspace.
+
+## D-016 — use conservative optimizer fallback and same-layer before/after reports
+
+**Status:** accepted for the v0.4 release contract
+
+If an optional pass cannot prove its preconditions or its candidate fails
+verification, qcc keeps the last verified O1/O0 schedule and reports the
+requested level, effective level, and fallback reason. Source-level unsupported
+constructs remain hard errors. A v0.4 resource report captures actual before and
+after snapshots after the same MCX-to-X/CX/CCX decomposition, including qubits,
+peak clean ancillas, gate counts, depth, and the declared T estimate. Resource
+reductions are release claims only when those paired measurements exist.
+
+## D-017 — defer arrays, pointers, pebbling, and ESOP to v0.5 exploration
+
+**Status:** accepted as a scope boundary
+
+v0.4 remains a scalar, acyclic, pure-C contract. Bounded arrays and pointers
+require an explicit reversible memory and aliasing model; global pebbling is a
+future space/time scheduling problem beyond local lifetime reuse; and ESOP
+synthesis is a future Boolean-network strategy. These are v0.5 limitations or
+stretch topics, not implicit v0.4 support.

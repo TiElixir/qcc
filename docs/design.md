@@ -24,7 +24,9 @@ approximated. The v0.1 baseline is straight-line integer code and v0.2 adds
 predicates, reversible control flow, and constant wiring. The v0.3 sections below
 specify arithmetic growth, MCX lowering, named QASM registers, and resource
  conventions. The v0.3 arithmetic, QASM, and resource implementations are
- integrated and covered by the release test suite.
+integrated and covered by the release test suite. The v0.4 section specifies
+semantics-preserving optimization and release reporting; it is a contract, not
+a claim that a resource reduction has already been measured.
 
 ## Frontend boundary
 
@@ -223,6 +225,158 @@ runtime divisor, a zero divisor, and signed division/remainder are outside
 this contract. Division by zero is rejected before lowering because the C
 source operation is undefined; qcc does not invent quotient or remainder bits.
 
+## v0.4 optimization contract
+
+v0.4 optimizes only a validated normalized SSA function and its reversible
+lowering. It does not widen the supported C subset, assign meaning to
+undefined behavior, or permit a pass to replace an unsupported operation with an
+approximation. Every optimization must preserve the function's fixed-width
+mapping, named input/output layout, and clean-workspace invariant for every
+defined input.
+
+This section specifies what an eventual v0.4 implementation and release report
+must guarantee. It is not a performance result: an optimizer level may emit the
+same circuit as its fallback, and no reduction is claimed without measured
+before/after resource snapshots.
+
+### Optimization boundary and SSA passes
+
+The optimizer starts after Clang output has been parsed, normalized, and
+validated against the supported subset. It may use typed SSA values, constant
+values, CFG edge identity, use counts, path predicates, and proven gate
+dependencies. It must not depend on source spelling, unstable SSA names, a
+particular Clang version, or undefined/poison behavior.
+
+The v0.4 SSA pass set is:
+
+- **Constant folding:** evaluate pure integer operations, casts, predicates,
+  and constant `select`/`phi` choices when widths, modulo behavior, and
+  definedness are known. A zero divisor, invalid shift, or other undefined
+  case remains a diagnostic; folding never creates a reversible meaning for it.
+- **Copy and identity propagation:** forward equivalent SSA values and remove
+  fixed-width identities such as a copy of a value or an operation with a
+  proven neutral operand, while preserving edge-specific `phi` semantics.
+- **Dead-value elimination:** remove an SSA definition only when it has no
+  observable result, no live consumer, and no role in a required compute or
+  inverse-cleanup schedule. An apparently dead value that owns workspace or
+  feeds an output copy is live for this rule.
+- **Predicate and mux simplification:** simplify a condition only when the
+  condition is known or the transformation is algebraically reversible. The
+  pass must preserve all reachable CFG edges and the incoming-edge meaning of
+  `phi` values.
+
+SSA changes are applied before optional circuit peepholes. The optimizer keeps a
+mapping from each surviving value to its source definition and cleanup schedule
+so that eliminating a name cannot accidentally eliminate the work needed to
+restore an ancilla.
+
+### Gate-level peepholes
+
+After lowering, qcc may apply local rewrites to logical or primitive reversible
+gates. The allowed v0.4 peephole class includes:
+
+- canceling adjacent identical self-inverse gates (`X`, `CX`, `CCX`, or a
+  logical `MCX`) and an explicitly paired compute/inverse schedule;
+- removing proven identity copies and zero-length wiring operations;
+- commuting gates only when their qubit dependencies are disjoint or a
+  separately proven commutation rule applies, then exposing a valid
+  cancellation; and
+- applying the same rules after MCX decomposition, with the primitive resource
+  report taken only after the final `X`/`CX`/`CCX` sequence is fixed.
+
+A peephole may not cross an output copy, a measurement boundary if a future
+backend adds one, a live control dependency, or a cleanup obligation merely to
+make two gates adjacent. Relative-phase substitutions, dirty-ancilla tricks,
+and hardware-specific identities are outside this v0.4 contract unless their
+phase and workspace behavior are separately specified and verified.
+
+### Lifetime-based eager uncomputation
+
+The baseline retains temporary work until the enclosing compute-copy-uncompute
+schedule finishes. O2 may release a temporary earlier. Lifetime analysis marks
+the definition, every use on every reachable CFG edge, the output-copy point,
+and the inverse schedule that restores the temporary. When the last use has
+completed, qcc may immediately apply the inverse of the exact compute schedule
+and return its workspace to the clean pool.
+
+Eager uncomputation is path-aware. A value used in one branch is not released
+before the other reachable branch and its merge/`phi` handling have completed;
+a path predicate remains live until all controlled work and its own cleanup are
+done. The inverse may run early only when all of its inputs remain available,
+no live gate depends on the temporary, and the inverse cannot alter an input,
+output, or another live value. If those facts cannot be proven, the baseline
+late cleanup is retained.
+
+### Ancilla reuse proof obligations
+
+Reusing a clean ancilla is a verified allocation decision, not a best-effort
+packing heuristic. Every reuse must discharge all of these obligations:
+
+1. **Clean acquisition:** the wire is zero on every incoming path at the point
+   of allocation, including paths through conditional cleanup.
+2. **Exclusive liveness:** no live SSA value, control, target, path predicate,
+   pending inverse, input, or output aliases the wire during its new lifetime.
+3. **Complete release:** the previous owner has been uncomputed by its inverse
+   schedule on every reachable path, with no residual phase or classical
+   garbage.
+4. **Stable layout:** the physical wire remains in the declared circuit domain;
+   reuse does not overlap gate operands or change the logical-to-OpenQASM
+   register mapping.
+5. **Equivalent behavior:** the optimized circuit has the same observable
+   output mapping as the baseline for every defined input and leaves all
+   declared workspaces clean. The proof/evidence must cover branch, `phi`,
+   early-return, and boundary cases relevant to the schedule.
+
+A failed or undecidable obligation is a reason to allocate a fresh clean
+ancilla or keep the prior schedule. It is never permission to reuse a dirty
+wire or to silently drop cleanup. Peak live ancilla usage and total allocated
+qubits must both be recomputed after reuse.
+
+### Optimizer levels
+
+The public v0.4 contract defines three levels. A level selects an allowed pass
+set; it is not a promise that a higher level will reduce any resource.
+
+| Level | Required behavior | Cleanup and fallback |
+| --- | --- | --- |
+| `O0` | Validated normalization and the deterministic v0.3 Bennett baseline; no optional SSA, peephole, eager-uncompute, or reuse pass | Fresh clean workspace and the baseline cleanup schedule are retained |
+| `O1` | `O0` plus the specified safe SSA simplifications and local gate peepholes | No lifetime-based reuse is required; an unprovable local rewrite is skipped |
+| `O2` | `O1` plus lifetime-based eager uncomputation and clean-ancilla reuse when every proof obligation is discharged | Each failed proof falls back to the last verified `O1`/`O0` schedule and is reported |
+
+The allowed pass set is monotonic, but resource counts need not improve at every
+level. O2 is allowed to equal O1 or O0. Levels above O2 have no v0.4 semantics
+and must not be silently treated as an alias for O2 by a release
+implementation.
+
+### Before/after resource reporting
+
+An optimized compilation must capture an actual **before** snapshot after the
+deterministic baseline has been lowered and all logical MCX operations have been
+expanded to the primitive `X`/`CX`/`CCX` layer. It then captures an **after**
+snapshot from the selected optimized or fallback circuit at that same layer.
+The snapshots use the same input/output layout, width, decomposition convention,
+and counting rules. Comparing a logical pre-decomposition count with a
+primitive post-decomposition count is invalid.
+
+Each snapshot reports at least:
+
+- `qubit_count`: total physical qubits in the selected layout;
+- `ancillas`: peak simultaneously live clean work qubits, with all released
+  wires accounted for;
+- `gate_count` and `gate_counts` for `x`, `cx`, and `ccx` (and `mcx` only in a
+  separately labeled logical snapshot);
+- `depth`, computed with the same dependency/layering rule; and
+- `t_count`, using the declared Toffoli decomposition convention.
+
+The enclosing report records `requested_level`, `effective_level`, and a
+machine-readable fallback reason when a requested pass was not applied. It may
+also provide derived deltas, but deltas must be calculated from the two emitted
+snapshots rather than from an asymptotic estimate. Existing flat resource keys
+remain the selected (`after`) view for compatibility. At `O0`, the before and
+after snapshots are intentionally the same baseline. A release note may claim a
+reduction only when the corresponding before/after values were actually
+measured and verified.
+
 ## Loop-unroll policy
 
 The frontend may accept a source loop only when it can prove a finite,
@@ -290,10 +444,11 @@ predicate, path flag, and comparator workspace returns to its initial value at
 the end of a compiled function; only declared outputs may differ from their
 initial state.
 
-This baseline may use more gates or ancillas than an optimized implementation,
-but it supplies a simple correctness reference. Later optimizer work may
-reduce gate count or reuse clean ancillas only if it preserves the same
-observable mapping and cleanup invariant.
+This baseline may use more gates or ancillas than a later optimized
+implementation, but it supplies the O0 correctness reference. v0.4 may reduce
+gate count or reuse clean ancillas only under the optimization proof
+obligations above; the baseline remains available for fallback and for the
+`before` resource snapshot.
 
 ## OpenQASM 3 register mapping
 
@@ -349,13 +504,13 @@ control contribute zero T gates. A backend that uses a different exact or
 relative-phase decomposition must report its own convention instead of
 silently reusing this estimate.
 
-`qubit_count` includes inputs, outputs, and allocated clean ancillas;
-`ancillas` is the peak number of clean work qubits in the selected layout;
-`gate_count` is the number of operations in the layer being reported; and
-`depth` is the sequential layer count where gates sharing a qubit cannot be
-placed in the same layer. A T estimate is not a measured hardware runtime or
-fidelity prediction; it is a portable accounting estimate for the selected
-decomposition convention.
+For each resource snapshot, `qubit_count` includes inputs, outputs, and
+allocated physical work qubits; `ancillas` is the peak number of simultaneously
+live clean work qubits in that snapshot; `gate_count` is the number of
+operations in the layer being reported; and `depth` is the sequential layer
+count where gates sharing a qubit cannot be placed in the same layer. A T
+estimate is not a measured hardware runtime or fidelity prediction; it is a
+portable accounting estimate for the selected decomposition convention.
 
 ## Outputs and validation
 

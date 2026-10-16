@@ -1,12 +1,13 @@
 # Supported C subset
 
-This document is the authoritative source-level contract for qcc v0.3. It
+This document is the authoritative source-level contract for qcc v0.4. It
 covers the constructs that may be lowered after Clang emits normalized textual
-LLVM IR. The v0.3 contract is deliberately narrower than C: a construct is
-supported only when its generated IR satisfies the value, CFG, arithmetic, and
-cleanup rules below.
+LLVM IR. v0.4 retains the v0.3 source subset and adds optimization semantics; it
+does not make arrays, pointers, or other previously rejected constructs
+supported. A construct is supported only when its generated IR satisfies the
+value, CFG, arithmetic, cleanup, and optimizer rules below.
 
-## Supported in v0.3
+## Supported in v0.4
 
 ### Function and value model
 
@@ -68,9 +69,51 @@ valid:
 - A source conditional expression may lower to `select` instead of a branch;
   both forms use the same reversible predicate and mux semantics.
 
-## Unsupported in v0.3
+## v0.4 optimizer semantics
 
-The following constructs are outside the authoritative v0.3 contract and must
+Optimization is a semantics-preserving schedule choice after source validation.
+It does not change the C-to-LLVM acceptance boundary or give a rejected
+construct a weaker interpretation. For every defined input, all supported
+levels must preserve the return value, input registers, output register
+mapping, and clean declared ancillas.
+
+The release contract defines these levels:
+
+- **O0** keeps the deterministic v0.3 Bennett compute-copy-uncompute baseline
+  and does not apply optional SSA, gate, eager-uncomputation, or reuse passes.
+- **O1** may constant-fold defined fixed-width SSA expressions, propagate
+  copies and identities, eliminate dead values, simplify known predicates/
+  muxes, and apply local reversible-gate cancellations or proven commuting
+  rewrites. It does not require lifetime-based ancilla reuse.
+- **O2** includes O1 and may eagerly uncompute a temporary at its last
+  path-aware use, then reuse its clean workspace only when the lifetime and
+  cleanup proof obligations in [design.md](design.md) are discharged.
+
+The level is an allowed pass set, not a performance promise. O2 may produce the
+same circuit as O1 or O0. Levels above O2 have no v0.4 meaning and must not be
+silently aliased to O2.
+
+### Conservative optimizer fallback
+
+The source validator remains strict: an unsupported opcode, pointer or array
+operation, undefined divisor, residual cycle, malformed edge set, or other
+source-level violation is a hard diagnostic at every optimizer level. Optional
+optimization has a narrower fallback rule. If a pass cannot prove constant
+validity, edge/lifetime safety, gate commutation, clean release, layout
+non-overlap, or semantic equivalence, qcc discards that candidate and retains
+the last verified schedule. O2 therefore falls back to a verified O1 or O0
+schedule rather than emitting an approximate circuit or reusing an uncertain
+wire.
+
+A v0.4 resource report records both the requested and effective level and a
+machine-readable fallback reason when applicable. It also records before/after
+snapshots from the same post-decomposition primitive layer. A fallback is not a
+resource reduction claim; the report must make clear which schedule actually
+ran.
+
+## Unsupported in v0.4
+
+The following constructs are outside the authoritative v0.4 contract and must
 be rejected:
 
 - Runtime, data-dependent, or partially unrolled loops; any CFG cycle,
@@ -86,7 +129,7 @@ be rejected:
 - Signed division and signed remainder (`sdiv`, `srem`, or signed C `/` and
   `%`) even when the divisor is a constant. Signed quotient/remainder sign
   restoration and the C `INT_MIN / -1` overflow case are outside this
-  v0.3 contract.
+  v0.4 contract.
 - Zero-divisor division or remainder, even if written as a constant. C makes
   this operation undefined, so qcc rejects it rather than choosing quotient or
   remainder bits.
@@ -109,8 +152,10 @@ Clang may lower a source construct into a different LLVM shape. The normalized
 LLVM IR is the validator's source of truth: qcc accepts a source program only
 when that shape is in the supported list, and it never skips an unrecognized
 instruction because the original C looked harmless. The v0.3 implementation
-and acceptance suite are integrated in this checkout; resource optimization
-and broader pointer/array support remain later work.
+and acceptance suite are integrated in this checkout. The v0.4 optimizer
+contract is specified above, but this documentation does not claim that its
+implementation or any resource reduction has shipped. Broader pointer/array
+support remains outside v0.4.
 
 ## Diagnostic policy
 
@@ -132,6 +177,9 @@ circuit. Diagnostics follow these rules:
 5. Keep diagnostics deterministic and source-aware enough for callers to fix
    the program. A missing location is not a reason to accept an unsupported
    construct.
+6. Treat inability to prove an optional optimization as a fallback to the last
+   verified schedule, not as permission to weaken source validation or emit an
+   unverified circuit.
 
 A diagnostic may include the function name and the normalized block/edge path,
 but it must not claim that an operation was lowered or tested when validation
