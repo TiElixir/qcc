@@ -49,9 +49,9 @@ pytest -q
 
 ### v0.2 — comparisons, predication, and bounded loops
 
-**Status:** The v0.2 semantic contract is being specified in this milestone.
-Implementation, integration, and acceptance evidence remain pending; the
-status language here makes no claim about unverified tests.
+**Status:** The v0.2 implementation is the current baseline. The acceptance
+commands are recorded below; this status line does not claim an unverified
+passing result.
 
 1. Add all integer `icmp` predicates, `select`, `phi`, and acyclic CFG support.
 2. Lower reversible predicates, muxes, and nested if/else diamonds while
@@ -62,14 +62,23 @@ status language here makes no claim about unverified tests.
 
 ### v0.3 — arithmetic growth and quantum host integration
 
-**Status:** Planned after the v0.2 contract and its acceptance evidence are
-complete.
+**Status:** The v0.2 implementation is the current baseline. v0.3 is
+specified here as a target only: implementation, integration, resource
+measurements, QASM output, Grover behavior, and acceptance evidence are not
+claimed by this documentation update until the corresponding changes and
+checks are recorded.
 
-1. Add multiplication and constant-divisor division/remainder.
-2. Add controlled arithmetic, MCX intermediate gates, and decomposition to
-   primitive gates.
-3. Complete OpenQASM 3 named-register output and internal validation.
-4. Add the required Grover oracle, optional Qiskit demo, and statevector tests.
+1. Add fixed-width multiplication and unsigned constant-divisor restoring
+   division/remainder, rejecting zero, runtime, and signed divisors.
+2. Add controlled arithmetic, MCX intermediate gates, and deterministic clean-
+   ancilla decomposition to primitive gates before QASM emission.
+3. Complete OpenQASM 3 named-register output, logical-to-register mapping, and
+   internal validation.
+4. Add the required Grover oracle integration path, an optional Qiskit host
+   demonstration, and statevector/regression tests.
+5. Record logical counts, post-decomposition X/CX/CCX counts, clean-ancilla
+   usage, depth, and the documented 7-T-per-CCX estimate for each measured
+   acceptance example.
 
 ### v0.4 — optimization and measured resource reduction
 
