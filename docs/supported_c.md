@@ -4,9 +4,7 @@ This document is the authoritative source-level contract for qcc v0.3. It
 covers the constructs that may be lowered after Clang emits normalized textual
 LLVM IR. The v0.3 contract is deliberately narrower than C: a construct is
 supported only when its generated IR satisfies the value, CFG, arithmetic, and
-cleanup rules below. A v0.3 design entry is a target contract, not by itself a
-claim that the current checkout has finished implementing that construct or
-passed its acceptance checks.
+cleanup rules below.
 
 ## Supported in v0.3
 
@@ -110,12 +108,9 @@ be rejected:
 Clang may lower a source construct into a different LLVM shape. The normalized
 LLVM IR is the validator's source of truth: qcc accepts a source program only
 when that shape is in the supported list, and it never skips an unrecognized
-instruction because the original C looked harmless. The current v0.2
-implementation remains the practical boundary in a checkout that has not
-integrated the v0.3 arithmetic and backend work. The v0.3 items
-above become practical support only after implementation and acceptance checks
-are recorded; this document does not turn a target operation into a verified
-result.
+instruction because the original C looked harmless. The v0.3 implementation
+and acceptance suite are integrated in this checkout; resource optimization
+and broader pointer/array support remain later work.
 
 ## Diagnostic policy
 

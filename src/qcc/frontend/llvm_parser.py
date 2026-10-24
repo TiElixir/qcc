@@ -549,6 +549,19 @@ def _operand(
             location,
         )
     if value in {"undef", "poison", "zeroinitializer"}:
+        if value == "poison":
+            zero_location = _source_keyword_location(
+                location.source_name,
+                ("/ 0", "% 0", "/0", "%0"),
+                location,
+            )
+            if zero_location != location:
+                raise UnsupportedConstructError(
+                    "division by zero",
+                    "division or remainder by zero is undefined and cannot be "
+                    "compiled; use a nonzero compile-time divisor",
+                    zero_location,
+                )
         raise UnsupportedConstructError(
             value,
             f"{value} operands are not supported; qcc requires defined integer values",

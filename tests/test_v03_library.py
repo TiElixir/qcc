@@ -68,7 +68,7 @@ def test_multiply_into_xors_into_a_dirty_product_register() -> None:
         circuit, left, right, product_register, ancillas = _multiplier_circuit(width)
         product_mask = (1 << (2 * width)) - 1
         for left_value, right_value, old_product in product(
-            range(1 << width), repeat=2
+            range(1 << width), repeat=3
         ):
             initial = left_value | (right_value << width) | (old_product << (2 * width))
             result = simulate(circuit, initial)

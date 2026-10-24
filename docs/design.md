@@ -23,8 +23,8 @@ control flow should produce an explicit diagnostic rather than being silently
 approximated. The v0.1 baseline is straight-line integer code and v0.2 adds
 predicates, reversible control flow, and constant wiring. The v0.3 sections below
 specify arithmetic growth, MCX lowering, named QASM registers, and resource
-conventions. They are semantic and accounting contracts, not evidence that
-every v0.3 operation is already present or verified in a particular checkout.
+ conventions. The v0.3 arithmetic, QASM, and resource implementations are
+ integrated and covered by the release test suite.
 
 ## Frontend boundary
 
@@ -354,9 +354,8 @@ silently reusing this estimate.
 `gate_count` is the number of operations in the layer being reported; and
 `depth` is the sequential layer count where gates sharing a qubit cannot be
 placed in the same layer. A T estimate is not a measured hardware runtime or
-fidelity prediction. Until a v0.3 implementation emits and records these
-layers, the formulas above are planning conventions rather than acceptance
-results.
+fidelity prediction; it is a portable accounting estimate for the selected
+decomposition convention.
 
 ## Outputs and validation
 

@@ -49,6 +49,7 @@ from ._common import (
     emit_cx,
     emit_x,
     register,
+    reverse_block,
     same_width,
     workspace_register,
 )
@@ -237,6 +238,43 @@ def _append_shifted_add(
         emit_cx(emitter, source[source_index], addend[shift + source_index])
 
 
+def _append_shifted_controlled_addition(
+    emitter: Emitter,
+    source: tuple[QubitLike, ...],
+    target: tuple[QubitLike, ...],
+    shift: int,
+    carry: QubitLike,
+    controls: Sequence[QubitLike],
+) -> None:
+    """Add ``source << shift`` into a wider target with one clean carry bit."""
+
+    if shift < 0 or shift + len(source) >= len(target) + 1:
+        raise ValueError("shifted add does not fit in the target register")
+    target_slice = target[shift : shift + len(source)]
+    control_bits = tuple(controls)
+
+    def majority(first: QubitLike, second: QubitLike, incoming: QubitLike) -> None:
+        _emit_controlled_cx(emitter, control_bits, first, second)
+        _emit_controlled_cx(emitter, control_bits, first, incoming)
+        _emit_controlled_ccx(emitter, control_bits, second, incoming, first)
+
+    def unmajority_add(
+        first: QubitLike, second: QubitLike, incoming: QubitLike
+    ) -> None:
+        _emit_controlled_ccx(emitter, control_bits, second, incoming, first)
+        _emit_controlled_cx(emitter, control_bits, first, incoming)
+        _emit_controlled_cx(emitter, control_bits, incoming, second)
+
+    majority(source[0], target_slice[0], carry)
+    for index in range(1, len(source)):
+        majority(source[index], target_slice[index], source[index - 1])
+    cout = target[shift + len(source)]
+    _emit_controlled_cx(emitter, control_bits, source[-1], cout)
+    for index in range(len(source) - 1, 0, -1):
+        unmajority_add(source[index], target_slice[index], source[index - 1])
+    unmajority_add(source[0], target_slice[0], carry)
+
+
 def _multiply(
     emitter: Emitter,
     multiplicand: Register,
@@ -313,6 +351,53 @@ def multiply_modular(
     )
 
 
+def multiply_into(
+    emitter: Emitter,
+    multiplicand: Register,
+    multiplier: Register,
+    target: Register,
+    workspace: Sequence[QubitLike] | QubitLike | None = None,
+    *,
+    ancillas: Sequence[QubitLike] | QubitLike | None = None,
+    carry: QubitLike | None = None,
+) -> Emitter:
+    """XOR the full widening product into a ``2*n`` target.
+
+    This oracle-oriented spelling computes the product into a private clean
+    history register, XOR-copies it into the caller's target, and uncomputes
+    the history.  The target therefore has XOR semantics even when it starts
+    dirty.
+    """
+
+    del workspace, ancillas, carry
+    first = register(multiplicand, "multiplicand")
+    second = register(multiplier, "multiplier")
+    result = register(target, "target")
+    same_width(first, second)
+    if len(result) != 2 * len(first):
+        raise ValueError(
+            "widening multiplication target must be twice the operand width"
+        )
+    disjoint(first, second, result, message="multiplication operands")
+    if not isinstance(emitter, CircuitBuilder):
+        raise ValueError("multiply_into requires a CircuitBuilder for clean history")
+    temporary = emitter.allocate_clean_ancillas(2 * len(first))
+    carry_bit = emitter.allocate_clean_ancillas(1)[0]
+    start = len(emitter)
+    multiply_widening(
+        emitter,
+        first,
+        second,
+        temporary,
+        workspace=(carry_bit,),
+    )
+    computation_stop = len(emitter)
+    for source_bit, target_bit in zip(temporary, result, strict=True):
+        emit_cx(emitter, source_bit, target_bit)
+    reverse_block(emitter, start, computation_stop)
+    return emitter
+
+
 def controlled_multiply_modular(
     emitter: Emitter,
     control: QubitLike | Sequence[QubitLike],
@@ -371,17 +456,25 @@ def multiply_widening(
         raise ValueError(
             "widening multiplication target must be twice the operand width"
         )
-    return _multiply(
+    control_bits: tuple[QubitLike, ...] = ()
+    _, carry_bit = _workspace(
         emitter,
-        first,
-        second,
-        result,
-        target_width=2 * len(first),
-        control=None,
-        workspace=workspace,
-        ancillas=ancillas,
-        carry=carry,
+        first + second + result,
+        0,
+        workspace,
+        ancillas,
+        carry,
     )
+    for shift in range(len(second)):
+        _append_shifted_controlled_addition(
+            emitter,
+            first,
+            result,
+            shift,
+            carry_bit,
+            (*control_bits, second[shift]),
+        )
+    return emitter
 
 
 def controlled_multiply_widening(
@@ -410,17 +503,24 @@ def controlled_multiply_widening(
             "widening multiplication target must be twice the operand width"
         )
     controls = _controls(control, "control")
-    return _multiply(
+    _, carry_bit = _workspace(
         emitter,
-        first,
-        second,
-        result,
-        target_width=2 * len(first),
-        control=controls,
-        workspace=workspace,
-        ancillas=ancillas,
-        carry=carry,
+        first + second + result + controls,
+        0,
+        workspace,
+        ancillas,
+        carry,
     )
+    for shift in range(len(second)):
+        _append_shifted_controlled_addition(
+            emitter,
+            first,
+            result,
+            shift,
+            carry_bit,
+            (*controls, second[shift]),
+        )
+    return emitter
 
 
 def multiply_by_constant_modular(
@@ -532,6 +632,7 @@ __all__ = [
     "controlled_widening_multiply",
     "multiply_by_constant_modular",
     "multiply_modular",
+    "multiply_into",
     "multiply_modular_into",
     "multiply_widening",
     "multiply_widening_into",

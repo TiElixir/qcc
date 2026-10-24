@@ -104,7 +104,10 @@ class ResourceReport:
 
     @property
     def counts(self) -> Mapping[str, int]:
-        return {"x": self.x, "cx": self.cnot, "ccx": self.toffoli}
+        counts = {"x": self.x, "cx": self.cnot, "ccx": self.toffoli}
+        if self.mcx:
+            counts["mcx"] = self.mcx
+        return counts
 
     @property
     def gate_counts(self) -> Mapping[str, int]:
@@ -122,7 +125,7 @@ class ResourceReport:
         }
 
     def as_dict(self) -> dict[str, int]:
-        return {
+        legacy = {
             "qubits": self.qubits,
             "ancillas": self.ancillas,
             "gates": self.gates,
@@ -130,12 +133,18 @@ class ResourceReport:
             "cx": self.cnot,
             "ccx": self.toffoli,
             "depth": self.depth,
-            "mcx": self.mcx,
-            "mcx_cx": self.mcx_cnot,
-            "primitive_gates": self.primitive_gate_count,
-            "toffoli_estimate": self.toffoli_estimate,
-            "t_count": self.t_count,
         }
+        if self.mcx:
+            legacy.update(
+                {
+                    "mcx": self.mcx,
+                    "mcx_cx": self.mcx_cnot,
+                    "primitive_gates": self.primitive_gate_count,
+                    "toffoli_estimate": self.toffoli_estimate,
+                    "t_count": self.t_count,
+                }
+            )
+        return legacy
 
 
 def _attribute(value: Any, names: tuple[str, ...], default: Any = None) -> Any:

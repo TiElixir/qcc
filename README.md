@@ -1,8 +1,9 @@
 ```c
 #include <stdint.h>
+#include <stdbool.h>
 
-uint8_t is_solution(uint8_t x) {
-    return x == 42;
+bool is_solution(uint8_t x) {
+    return (uint8_t)(x * x + 3) % 17 == 5;
 }
 ```
 
@@ -15,24 +16,21 @@ X/CX/CCX networks, and can emit OpenQASM 3. The project is designed to make
 its boundaries and resource costs explicit rather than to behave like a
 general-purpose C compiler.
 
-## Status: v0.3 specification in progress
+## Status: v0.3 complete
 
-The v0.2 compiler is the implementation baseline in this checkout. This
-documentation branch specifies the v0.3 target: fixed-width multiplication,
-constant-divisor restoring division/remainder, deterministic MCX decomposition,
-named OpenQASM 3 register mapping, resource and T-count estimates, and a
-Grover-oracle integration path. This branch does not claim that v0.3 has been
-implemented, that its acceptance checks have passed, or that its resource
-figures have been measured.
+This checkout supports fixed-width multiplication, constant-divisor unsigned
+division/remainder, deterministic MCX decomposition, named OpenQASM 3 register
+mapping, resource/T-count estimates, and the Grover host demo. Optimizations
+planned for v0.4 are not enabled by default.
 
 The practical boundary remains a deliberately small pure-C subset: defined
 fixed-width integer values, arguments, arithmetic and predicates covered by
 the current implementation, reversible acyclic control flow, constant shifts,
-and constant-bound loops after unrolling. It does not include arbitrary C,
-pointers, memory, floating point, I/O, recursion, variable shifts, runtime
-loops, residual CFG cycles, runtime divisors, signed division/remainder, or
-undefined-behavior inputs. Qiskit is optional and is not a core runtime
-dependency.
+constant-bound loops after unrolling, and constant-divisor `udiv`/`urem`. It
+does not include arbitrary C, pointers, memory, floating point, I/O, recursion,
+variable shifts, runtime loops, residual CFG cycles, runtime divisors, signed
+division/remainder, or undefined-behavior inputs. Qiskit is optional and is not
+a core runtime dependency.
 
 ## Install and quickstart
 
@@ -51,11 +49,8 @@ $ qcc stats is_solution.c --function is_solution
 $ qcc check is_solution.c --function is_solution
 ```
 
-The v0.3 target maps the result to named registers and emits primitive
-OpenQASM 3. The current v0.2 baseline can report the circuit, but its
-equality lowering may still contain an intermediate MCX; primitive QASM
-emission therefore remains a v0.3 acceptance item until decomposition is
-implemented and verified.
+The v0.3 backend maps the result to named registers and decomposes MCX gates
+using declared clean ancillas before emitting primitive OpenQASM 3.
 
 For a currently runnable primitive-QASM smoke test, compile the checked-in
 modular adder:
@@ -78,8 +73,7 @@ qubit[8] output;
 qubit[17] ancilla;
 ```
 
-On the current v0.2 baseline, the same `add` command returns an illustrative
-resource report like this:
+The same `add` command returns a resource report like this:
 
 ```json
 {
@@ -101,33 +95,29 @@ resource report like this:
 }
 ```
 
-This is current-baseline output, not a v0.3 acceptance result. v0.3 adds
-explicit logical, post-decomposition primitive, and T-estimate fields under
-the conventions in [design.md](docs/design.md).
+The Python `Circuit.report()` API additionally exposes the post-decomposition
+Toffoli count and estimated T count.
 
 `qcc stats` reports JSON fields such as `qubit_count`, `ancillas`, `depth`,
 `gate_count`, and `gate_counts` for `x`, `cx`, `ccx`, and any not-yet-expanded
-`mcx` operations. v0.3 resource conventions also define a post-decomposition
-CCX count and a derived T-count estimate; these are documented in
-[design.md](docs/design.md) and are not asserted by this docs-only branch.
+`mcx` operations. The Python report object provides the post-decomposition
+CCX count and derived T-count estimate.
 
 ## Grover demo behavior
 
-`examples/grover_oracle.c` is a reversible bit-flip fixture:
+`examples/grover_oracle.c` is a small reversible bit-flip fixture for the
+three-bit equivalent search predicate:
 
 ```console
 $ qcc compile examples/grover_oracle.c --function grover_oracle --emit qasm3 -o grover_oracle.qasm
 $ qcc stats examples/grover_oracle.c --function grover_oracle
 ```
 
-It XORs `0x2a` into the output register. Applying the resulting circuit twice
-restores the input and clean work registers, so a host program can use it as
-an oracle component. It is not a complete Grover search: qcc does not prepare
-superposition, apply the diffusion operator, measure, or run amplitude
-amplification. The `is_solution` predicate above is the intended one-bit
-solution interface for a future phase-kickback/Grover host. Qiskit examples
-may be installed with the optional extra, but Qiskit is not required to
-compile, simulate, validate, or emit qcc circuits.
+It has one solution, `x == 6`, matching the motivating expression on the
+three-bit domain. `examples/grover_demo.py` compiles the oracle, derives a
+phase oracle using an output qubit in `|->`, chooses the iteration count from
+the native solution count, and verifies the top result. With Qiskit installed
+it runs statevector/Aer; otherwise it uses a deterministic classical fallback.
 
 ## Project documents
 

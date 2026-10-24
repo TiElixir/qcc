@@ -727,6 +727,56 @@ class Circuit:
             name=self.name,
         )
 
+    def decompose_mcx(self) -> Circuit:
+        """Return an equivalent X/CX/CCX circuit using clean layout ancillas.
+
+        A gate with ``k`` controls uses ``k - 2`` declared clean ancillas as a
+        conjunction ladder.  Each ladder is uncomputed before the next gate,
+        so the same workspace can safely be reused across the circuit.
+        """
+
+        if not any(gate.op == "MCX" for gate in self.gates):
+            return self
+        ancillas = () if self.layout is None else tuple(self.layout.ancillas)
+        expanded: list[Gate] = []
+        for gate in self.gates:
+            if gate.op != "MCX":
+                expanded.append(gate)
+                continue
+            controls = tuple(gate.controls)
+            target = gate.target
+            if len(controls) == 1:
+                expanded.append(Gate.cx(controls[0], target))
+                continue
+            if len(controls) == 2:
+                expanded.append(Gate.ccx(controls[0], controls[1], target))
+                continue
+            required = len(controls) - 2
+            work = ancillas[:required]
+            if len(work) != required:
+                raise ValueError(
+                    f"MCX with {len(controls)} controls requires {required} "
+                    "clean ancilla qubits in the circuit layout"
+                )
+            operands = (*controls, target, *work)
+            if len(set(operands)) != len(operands):
+                raise ValueError("MCX clean workspace overlaps its operands")
+            ladder = [Gate.ccx(controls[0], controls[1], work[0])]
+            for index in range(2, len(controls) - 1):
+                ladder.append(
+                    Gate.ccx(work[index - 2], controls[index], work[index - 1])
+                )
+            ladder.append(Gate.ccx(work[-1], controls[-1], target))
+            expanded.extend(ladder)
+            expanded.extend(reversed(ladder[:-1]))
+        return Circuit(
+            tuple(expanded),
+            num_qubits=self.num_qubits,
+            layout=self.layout,
+            domain=self.domain,
+            name=self.name,
+        )
+
     invert = inverse
 
     def validate(self) -> Circuit:
@@ -959,6 +1009,28 @@ class CircuitBuilder:
 
     def mcx(self, controls: Iterable[QubitLike], target: QubitLike) -> CircuitBuilder:
         return self.append(Gate.mcx(controls, target))
+
+    def allocate_clean_ancillas(self, count: int) -> tuple[int, ...]:
+        """Extend the builder with clean workspace wires for a library block."""
+
+        count = _as_index(count)
+        bits = tuple(range(self._num_qubits, self._num_qubits + count))
+        self._num_qubits += count
+        if self._layout is None:
+            registers: Mapping[str, Iterable[QubitLike]] = {}
+            old_ancillas: tuple[QubitLike, ...] = ()
+        else:
+            registers = self._layout.registers
+            old_ancillas = self._layout.ancillas
+        self._layout = CircuitLayout(
+            registers,
+            ancillas=(*old_ancillas, *bits),
+            num_qubits=self._num_qubits,
+            domain=self._domain,
+        )
+        return bits
+
+    allocate_workspace = allocate_clean_ancillas
 
     # Explicit add_* spellings are convenient in lowering code.
     add_x = x

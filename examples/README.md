@@ -1,8 +1,9 @@
 ```c
 #include <stdint.h>
+#include <stdbool.h>
 
-uint8_t is_solution(uint8_t x) {
-    return x == 42;
+bool is_solution(uint8_t x) {
+    return (uint8_t)(x * x + 3) % 17 == 5;
 }
 ```
 
@@ -43,8 +44,7 @@ qubit[8] output;
 qubit[17] ancilla;
 ```
 
-On the current v0.2 baseline, the same `add` command returns an illustrative
-resource report like this:
+The same `add` command returns a resource report like this:
 
 ```json
 {
@@ -66,9 +66,8 @@ resource report like this:
 }
 ```
 
-This is current-baseline output, not a v0.3 acceptance result. v0.3 adds
-explicit logical, post-decomposition primitive, and T-estimate fields under
-the conventions in [design.md](../docs/design.md).
+The Python `Circuit.report()` API also exposes post-decomposition Toffoli and
+estimated T-count fields.
 
 The resource command prints JSON with fields including `qubit_count`,
 `ancillas`, `depth`, `gate_count`, and `gate_counts`. Exact counts are
@@ -83,26 +82,23 @@ $ qcc compile is_solution.c --function is_solution --emit qasm3 -o is_solution.q
 $ qcc stats is_solution.c --function is_solution
 ```
 
-The v0.2 baseline may report an intermediate MCX for equality and may reject
-primitive QASM emission until the v0.3 clean-ancilla decomposition is in
-place. That limitation is intentional and is part of the v0.3 acceptance
-work, rather than a reason to silently approximate the predicate.
+The v0.3 backend decomposes intermediate MCX gates using declared clean
+ancillas before emitting primitive QASM, and rejects circuits whose workspace
+contract cannot be proven.
 
 ## Grover oracle fixture
 
-`grover_oracle.c` contains a self-inverse bit-flip oracle:
+`grover_oracle.c` contains a self-inverse three-bit bit-flip oracle:
 
 ```console
 $ qcc compile examples/grover_oracle.c --function grover_oracle --emit qasm3 -o grover_oracle.qasm
 $ qcc stats examples/grover_oracle.c --function grover_oracle
 ```
 
-It XORs the fixed mask `0x2a` into the output register. Applying the generated
-circuit twice restores the input and clean work registers. The fixture is an
-oracle component for a host program with its own work/phase register; it does
-not by itself prepare a superposition, run the diffusion operator, measure, or
-perform a complete Grover search. The `is_solution` function is the intended
-one-bit predicate for the future phase-kickback path.
+It marks `x == 6`, the solution of the motivating expression over `[0, 7]`.
+`examples/grover_demo.py` runs the host-side phase-kickback/diffusion flow and
+verifies the result against native brute force. Applying the generated oracle
+twice restores the input and clean work registers.
 
 Qiskit can be installed for host-side experiments:
 

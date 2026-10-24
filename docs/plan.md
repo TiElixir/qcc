@@ -22,9 +22,7 @@ compute-copy-uncompute so every temporary returns to its initial value.
 
 ### v0.1 — straight-line uint8_t
 
-**Status:** The v0.1 straight-line boundary is the current implementation
-baseline. This plan records the acceptance commands but does not claim that
-they have been run successfully for this checkout.
+**Status:** Complete and tagged `v0.1.0`.
 
 1. Bootstrap packaging, CI, errors, and documentation.
 2. Invoke Clang with optimized, non-vectorized textual LLVM output.
@@ -49,9 +47,7 @@ pytest -q
 
 ### v0.2 — comparisons, predication, and bounded loops
 
-**Status:** The v0.2 implementation is the current baseline. The acceptance
-commands are recorded below; this status line does not claim an unverified
-passing result.
+**Status:** Complete and tagged `v0.2.0`.
 
 1. Add all integer `icmp` predicates, `select`, `phi`, and acyclic CFG support.
 2. Lower reversible predicates, muxes, and nested if/else diamonds while
@@ -62,11 +58,8 @@ passing result.
 
 ### v0.3 — arithmetic growth and quantum host integration
 
-**Status:** The v0.2 implementation is the current baseline. v0.3 is
-specified here as a target only: implementation, integration, resource
-measurements, QASM output, Grover behavior, and acceptance evidence are not
-claimed by this documentation update until the corresponding changes and
-checks are recorded.
+**Status:** Complete and integrated; the v0.3 release tag is pending the final
+release-gate commit on `main`.
 
 1. Add fixed-width multiplication and unsigned constant-divisor restoring
    division/remainder, rejecting zero, runtime, and signed divisors.
