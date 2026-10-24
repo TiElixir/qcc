@@ -520,6 +520,7 @@ class Circuit:
     layout: CircuitLayout | None
     domain: object | None
     name: str | None
+    optimization_level: int | None = field(default=None, compare=False)
     _compiled: tuple[tuple[int, int, int], ...] = field(
         init=False, repr=False, compare=False
     )
@@ -534,6 +535,7 @@ class Circuit:
         layout: CircuitLayout | Mapping[str, Iterable[QubitLike]] | None = None,
         domain: object | None = None,
         name: str | None = None,
+        optimization_level: int | None = None,
     ) -> None:
         # ``Circuit(4)`` is a useful empty-circuit shorthand.
         if isinstance(gates, int) and num_qubits is None:
@@ -580,6 +582,13 @@ class Circuit:
         object.__setattr__(self, "layout", layout)
         object.__setattr__(self, "domain", actual_domain)
         object.__setattr__(self, "name", name)
+        if optimization_level is not None and (
+            isinstance(optimization_level, bool)
+            or not isinstance(optimization_level, int)
+            or optimization_level < 0
+        ):
+            raise ValueError("optimization level must be a non-negative integer")
+        object.__setattr__(self, "optimization_level", optimization_level)
         compiled: list[tuple[int, int, int]] = []
         operation_codes = {"X": 0, "CX": 1, "CCX": 2, "MCX": 3}
         for gate in gate_tuple:
@@ -725,6 +734,7 @@ class Circuit:
             layout=self.layout,
             domain=self.domain,
             name=self.name,
+            optimization_level=self.optimization_level,
         )
 
     def decompose_mcx(self) -> Circuit:
@@ -775,6 +785,7 @@ class Circuit:
             layout=self.layout,
             domain=self.domain,
             name=self.name,
+            optimization_level=self.optimization_level,
         )
 
     invert = inverse
@@ -811,12 +822,27 @@ class Circuit:
     def resource_counts(self) -> ResourceCounts:
         return self.resources()
 
-    def report(self) -> Any:
+    def optimize(self, level: int = 2, *, opt: int | None = None) -> Circuit:
+        """Return a v0.4-optimized copy while preserving the circuit layout."""
+
+        from qcc.opt.gates import optimize_circuit
+
+        selected = level if opt is None else opt
+        return optimize_circuit(self, selected)
+
+    @property
+    def optimizer(self) -> int | None:
+        """Return the optimizer level used to produce this circuit, if known."""
+
+        return self.optimization_level
+
+    def report(self, *, opt: int | None = None) -> Any:
         """Return the backend-neutral resource report for this circuit."""
 
         from qcc.backend.report import resource_report
 
-        return resource_report(self)
+        target = self if opt is None else self.optimize(opt)
+        return resource_report(target)
 
     resource_report = report
 
