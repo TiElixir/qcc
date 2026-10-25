@@ -9,6 +9,7 @@ that the frontend and circuit packages can evolve independently.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,7 @@ from .ancilla import AncillaAllocator, CircuitLayout, Register
 from .bennett import (
     BennettScheduler,
     Gate,
+    add_modular,
     add_registers,
     and_bits,
     copy_bits,
@@ -114,6 +116,15 @@ class _Value:
     width: int
     register: Register
     constant: int | None = None
+
+
+@dataclass(frozen=True)
+class _Producer:
+    """The reversible history and leases belonging to one SSA value."""
+
+    gates: tuple[Gate, ...]
+    leases: tuple[Register, ...]
+    dependencies: tuple[_Value, ...]
 
 
 _MISSING = object()
@@ -753,14 +764,26 @@ def _comparison_width(operation: _Operation) -> int | None:
 
 
 class _Lowerer:
-    def __init__(self, function: Any, function_name: str | None) -> None:
+    def __init__(
+        self,
+        function: Any,
+        function_name: str | None,
+        *,
+        reuse_ancillas: bool = False,
+    ) -> None:
         self.function_name = function_name or _normalise_name(
             _field(function, ("name", "identifier"), None)
         )
-        self.allocator = AncillaAllocator()
+        self.reuse_ancillas = reuse_ancillas
+        self.allocator = AncillaAllocator(reuse=reuse_ancillas)
         self.scheduler = BennettScheduler()
         self.values: dict[str, _Value] = {}
         self.constants: dict[tuple[int, int], _Value] = {}
+        self._producers: dict[str, _Producer] = {}
+        self._remaining_uses: dict[str, int] = {}
+        self._dependency_users: dict[str, int] = {}
+        self._captured_dependencies: list[_Value] | None = None
+        self._current_alias: _Value | None = None
         self._constant_counter = 0
         self._temporary_counter = 0
         self._returns: list[tuple[_Value, _Guard]] = []
@@ -799,18 +822,37 @@ class _Lowerer:
             self._source_location(operation),
         )
 
+    def _capture_value(self, value: _Value) -> _Value:
+        if self._captured_dependencies is not None:
+            self._captured_dependencies.append(value)
+        return value
+
+    def _record_constant_producer(
+        self,
+        value: _Value,
+        start: int,
+        allocation_mark: int,
+    ) -> None:
+        if not self.reuse_ancillas:
+            return
+        self._producers[value.name] = _Producer(
+            gates=self.scheduler.block(start),
+            leases=self.allocator.allocations_since(allocation_mark),
+            dependencies=(),
+        )
+
     def _resolve(self, raw: Any, width_hint: int | None = None) -> _Value:
         if isinstance(raw, _Value):
-            return raw
+            return self._capture_value(raw)
         name = _value_name(raw)
         if name is not None:
             if name not in self.values:
                 raise SSAFormatError(f"unknown SSA value {name!r}")
-            return self.values[name]
+            return self._capture_value(self.values[name])
         if isinstance(raw, str):
             normal = _normalise_name(raw)
             if normal in self.values:
-                return self.values[normal]
+                return self._capture_value(self.values[normal])
         literal = _as_literal(raw)
         if literal is None:
             raise SSAFormatError(
@@ -827,16 +869,19 @@ class _Lowerer:
         key = (width, value)
         existing = self.constants.get(key)
         if existing is not None:
-            return existing
+            return self._capture_value(existing)
         name = f"const.{self._constant_counter}"
         self._constant_counter += 1
+        allocation_mark = self.allocator.allocation_mark()
+        start = self.scheduler.mark()
         register = self.allocator.allocate_constant(width, name)
         for bit, qubit in enumerate(register.bits):
             if value & (1 << bit):
                 self.scheduler.x(qubit)
         result = _Value(name, width, register, value)
         self.constants[key] = result
-        return result
+        self._record_constant_producer(result, start, allocation_mark)
+        return self._capture_value(result)
 
     def _allocate_result(self, operation: _Operation, width: int) -> _Value:
         name = operation.result
@@ -852,6 +897,175 @@ class _Lowerer:
     @staticmethod
     def _mask(width: int) -> int:
         return (1 << width) - 1
+
+    @staticmethod
+    def _unique_values(values: Iterable[_Value]) -> tuple[_Value, ...]:
+        result: list[_Value] = []
+        seen: set[str] = set()
+        for value in values:
+            if value.name not in seen:
+                result.append(value)
+                seen.add(value.name)
+        return tuple(result)
+
+    def _in_place_add_source(
+        self,
+        operation: _Operation,
+        first: _Value,
+        second: _Value,
+    ) -> _Value | None:
+        """Return a dead first operand eligible for in-place modular addition.
+
+        The proof is deliberately narrow: this is a straight-line operation,
+        the first operand is a produced non-constant value, it is used exactly
+        once more (by this operation), and the second register is distinct.
+        Its producer history is retained as part of the new value's cleanup
+        history, so overwriting the physical register cannot lose reversibility.
+        """
+
+        if not self.reuse_ancillas or operation.opcode != "add":
+            return None
+        if first.constant is not None or first.register.bits == second.register.bits:
+            return None
+        if operation.result is None or operation.result in self.values:
+            return None
+        producer = self._producers.get(first.name)
+        if producer is None:
+            return None
+        occurrences = sum(
+            1 for operand in operation.operands if _value_name(operand) == first.name
+        )
+        if occurrences != 1:
+            return None
+        if self._remaining_uses.get(first.name, 0) != occurrences:
+            return None
+        if self._dependency_users.get(first.name, 0) != 0:
+            return None
+        return first
+
+    def _allocate_alias_result(self, operation: _Operation, source: _Value) -> _Value:
+        name = operation.result
+        if name is None:
+            raise SSAFormatError(f"{self._error_context(operation)} has no SSA result")
+        if name in self.values:
+            raise SSAFormatError(f"SSA value {name!r} is defined more than once")
+        result = _Value(name, source.width, source.register)
+        self.values[name] = result
+        self._current_alias = source
+        return result
+
+    def _install_producer(
+        self,
+        value: _Value,
+        gates: tuple[Gate, ...],
+        leases: tuple[Register, ...],
+        dependencies: tuple[_Value, ...],
+    ) -> None:
+        alias = self._current_alias
+        if alias is None:
+            producer = _Producer(gates, leases, dependencies)
+            self._producers[value.name] = producer
+            for dependency in dependencies:
+                self._dependency_users[dependency.name] = (
+                    self._dependency_users.get(dependency.name, 0) + 1
+                )
+            self._remaining_uses.setdefault(value.name, 0)
+            return
+
+        previous = self._producers.pop(alias.name, None)
+        if previous is None:
+            raise SSAFormatError(
+                f"cannot retain in-place history for SSA value {alias.name!r}"
+            )
+        previous_names = {dependency.name for dependency in previous.dependencies}
+        merged = self._unique_values(
+            (*previous.dependencies, *(item for item in dependencies if item != alias))
+        )
+        producer = _Producer(
+            gates=previous.gates + gates,
+            leases=previous.leases + leases,
+            dependencies=merged,
+        )
+        self._producers[value.name] = producer
+        for dependency in merged:
+            if dependency.name not in previous_names:
+                self._dependency_users[dependency.name] = (
+                    self._dependency_users.get(dependency.name, 0) + 1
+                )
+        self._remaining_uses.setdefault(value.name, 0)
+
+    def _cleanup_value(self, name: str) -> None:
+        producer = self._producers.pop(name, None)
+        if producer is None:
+            return
+        self.scheduler.extend(reversed(producer.gates))
+        for lease in reversed(producer.leases):
+            self.allocator.release(lease)
+        for dependency in producer.dependencies:
+            count = self._dependency_users.get(dependency.name, 0) - 1
+            if count <= 0:
+                self._dependency_users.pop(dependency.name, None)
+            else:
+                self._dependency_users[dependency.name] = count
+        for key, constant in tuple(self.constants.items()):
+            if constant.name == name:
+                del self.constants[key]
+
+    def _cleanup_available(self) -> None:
+        """Uncompute dead values in dependency-safe reverse order."""
+
+        while True:
+            candidate = next(
+                (
+                    name
+                    for name in self._producers
+                    if self._remaining_uses.get(name, 0) == 0
+                    and self._dependency_users.get(name, 0) == 0
+                ),
+                None,
+            )
+            if candidate is None:
+                return
+            self._cleanup_value(candidate)
+
+    def _consume_operands(self, operation: _Operation) -> None:
+        for operand in operation.operands:
+            name = _value_name(operand)
+            if name is not None:
+                remaining = self._remaining_uses.get(name, 0) - 1
+                if remaining < 0:
+                    raise SSAFormatError(
+                        f"SSA value {name!r} has more uses than its lifetime analysis"
+                    )
+                self._remaining_uses[name] = remaining
+
+    def _emit_reusable_operation(self, operation: _Operation) -> None:
+        self._current_alias = None
+        self._captured_dependencies = []
+        self._prepare_operation(operation)
+        allocation_mark = self.allocator.allocation_mark()
+        start = self.scheduler.mark()
+        self._emit_operation_unconditional(operation, known_constant=True)
+        gates = self.scheduler.block(start)
+        dependencies = self._unique_values(self._captured_dependencies)
+        # A literal resolved unusually late is registered as its own producer;
+        # do not release its lease together with the enclosing SSA result.
+        leases = tuple(
+            lease
+            for lease in self.allocator.allocations_since(allocation_mark)
+            if lease.kind != "constant"
+        )
+        if operation.result is None:
+            raise SSAFormatError(f"{self._error_context(operation)} has no SSA result")
+        result = self.values.get(operation.result)
+        if result is None:
+            raise SSAFormatError(
+                f"{self._error_context(operation)} did not define its SSA result"
+            )
+        self._install_producer(result, gates, leases, dependencies)
+        self._captured_dependencies = None
+        self._consume_operands(operation)
+        self._cleanup_available()
 
     def _set_constant(self, target: _Value, value: int) -> None:
         value &= self._mask(target.width)
@@ -930,9 +1144,22 @@ class _Lowerer:
                 f"{self._error_context(operation)} has mismatched widths "
                 f"{first.width}, {second.width}, and result {width}"
             )
-        target = self._allocate_result(operation, width)
+        alias = self._in_place_add_source(operation, first, second)
+        target = (
+            self._allocate_alias_result(operation, alias)
+            if alias is not None
+            else self._allocate_result(operation, width)
+        )
         if operation.opcode == "mul":
             self._emit_multiply(first, second, target)
+        elif operation.opcode == "add" and alias is not None:
+            add_modular(
+                self.scheduler,
+                second.register,
+                target.register,
+                self.allocator,
+                label=f"{target.name}.add-in-place",
+            )
         elif operation.opcode == "add":
             add_registers(
                 self.scheduler,
@@ -1804,7 +2031,140 @@ class _Lowerer:
         value = self._resolve(operands[0], _width_of(operation.width_spec))
         self._returns.append((value, guard))
 
+    def _supports_reuse(self, blocks: tuple[_Block, ...]) -> bool:
+        """Prove that the straight-line lifetime policy applies."""
+
+        if len(blocks) != 1:
+            return False
+        try:
+            terminator = self._terminator(blocks[0])
+        except SSAFormatError:
+            return False
+        if terminator is not None and terminator.opcode not in {"ret", "return"}:
+            return False
+        return all(
+            operation.opcode not in {"phi", "br", "switch", "unreachable"}
+            for operation in blocks[0].operations
+        )
+
+    def _reusable_use_counts(
+        self,
+        function: Any,
+        block: _Block,
+        terminator: _Operation | None,
+    ) -> dict[str, int]:
+        counts: Counter[str] = Counter()
+        for operation in block.operations:
+            operands = (
+                _return_operands(operation)
+                if operation.opcode in {"ret", "return"}
+                else operation.operands
+            )
+            for operand in operands:
+                name = _value_name(operand)
+                if name is not None:
+                    counts[name] += 1
+        if terminator is None:
+            explicit = _explicit_return(function)
+            if explicit is not _MISSING:
+                if isinstance(explicit, (tuple, list)) and len(explicit) == 1:
+                    explicit = explicit[0]
+                name = _value_name(explicit)
+                if name is not None:
+                    counts[name] += 1
+        return dict(counts)
+
+    def _reusable_return(
+        self,
+        function: Any,
+        terminator: _Operation | None,
+    ) -> _Value:
+        self._captured_dependencies = []
+        if terminator is not None:
+            self._prepare_operation(terminator)
+            operands = _return_operands(terminator)
+            if len(operands) != 1:
+                raise SSAFormatError(
+                    f"{self._error_context(terminator)} expects one returned value"
+                )
+            value = self._resolve(operands[0], _width_of(terminator.width_spec))
+        else:
+            explicit = _explicit_return(function)
+            if explicit is _MISSING:
+                raise SSAFormatError(
+                    f"function {self.function_name or '<anonymous>'!r} has no "
+                    "return value"
+                )
+            if isinstance(explicit, (tuple, list)) and len(explicit) == 1:
+                explicit = explicit[0]
+            return_width = _width_of(
+                _field(function, ("return_type", "result_type", "type"), None)
+            )
+            value = self._resolve(explicit, return_width)
+        self._captured_dependencies = None
+        return value
+
+    def _lower_reusable(
+        self,
+        function: Any,
+        blocks: tuple[_Block, ...],
+    ) -> LoweredCircuit:
+        block = blocks[0]
+        terminator = self._terminator(block)
+        body = block.operations[:-1] if terminator is not None else block.operations
+        self._remaining_uses = self._reusable_use_counts(function, block, terminator)
+        for operation in body:
+            self._emit_reusable_operation(operation)
+
+        value = self._reusable_return(function, terminator)
+        return_width = value.width
+        declared_width = _width_of(
+            _field(function, ("return_type", "result_type"), None)
+        )
+        if declared_width is not None and declared_width != return_width:
+            raise SSAFormatError(
+                f"return width {return_width} does not match declared width "
+                f"{declared_width}"
+            )
+
+        output = self.allocator.allocate_output(
+            return_width,
+            name=f"{self.function_name or 'function'}.output",
+        )
+        copy_bits(self.scheduler, value.register.bits, output.bits)
+        if value.name in self._remaining_uses:
+            self._remaining_uses[value.name] -= 1
+        self._cleanup_available()
+        if self._producers:
+            # An unhandled lifetime shape is never guessed at.  Re-run the
+            # immutable v0.3 schedule rather than returning a partially cleaned
+            # optimized circuit.
+            return _Lowerer(
+                function,
+                self.function_name,
+                reuse_ancillas=False,
+            ).lower(function)
+        layout = self.allocator.layout(output)
+        return LoweredCircuit(
+            gates=self.scheduler.gates,
+            num_qubits=self.allocator.num_qubits,
+            layout=layout,
+            function_name=self.function_name,
+        )
+
     def lower(self, function: Any) -> LoweredCircuit:
+        blocks = _extract_blocks(function)
+        if self.reuse_ancillas:
+            if self._supports_reuse(blocks):
+                return self._lower_reusable(function, blocks)
+            return _Lowerer(
+                function,
+                self.function_name,
+                reuse_ancillas=False,
+            ).lower(function)
+        return self._lower_baseline(function)
+
+    def _lower_baseline(self, function: Any) -> LoweredCircuit:
         blocks = _extract_blocks(function)
         if not blocks:
             raise SSAFormatError("function has no basic blocks or instructions")
@@ -2000,24 +2360,65 @@ class _Lowerer:
         )
 
 
-def lower_ssa(function: Any, *, function_name: str | None = None) -> LoweredCircuit:
-    """Lower one fixed-width SSA function into a Bennett-clean circuit."""
+def lower_ssa(
+    function: Any,
+    *,
+    function_name: str | None = None,
+    optimization_level: int = 0,
+    reuse_ancillas: bool | None = None,
+) -> LoweredCircuit:
+    """Lower one fixed-width SSA function into a Bennett-clean circuit.
 
-    return _Lowerer(function, function_name).lower(function)
+    ``optimization_level >= 2`` selects the conservative straight-line
+    lifetime allocator.  ``reuse_ancillas`` is an explicit switch for callers
+    that use the lowering API directly; an unsafe CFG shape falls back to the
+    v0.3 schedule.
+    """
+
+    if optimization_level < 0:
+        raise ValueError("optimization_level must be non-negative")
+    enabled = (
+        optimization_level >= 2 if reuse_ancillas is None else bool(reuse_ancillas)
+    )
+    return _Lowerer(
+        function,
+        function_name,
+        reuse_ancillas=enabled,
+    ).lower(function)
 
 
-def lower(function: Any, *, function_name: str | None = None) -> LoweredCircuit:
+def lower(
+    function: Any,
+    *,
+    function_name: str | None = None,
+    optimization_level: int = 0,
+    reuse_ancillas: bool | None = None,
+) -> LoweredCircuit:
     """Compatibility alias for :func:`lower_ssa`."""
 
-    return lower_ssa(function, function_name=function_name)
+    return lower_ssa(
+        function,
+        function_name=function_name,
+        optimization_level=optimization_level,
+        reuse_ancillas=reuse_ancillas,
+    )
 
 
 def ssa_to_reversible(
-    function: Any, *, function_name: str | None = None
+    function: Any,
+    *,
+    function_name: str | None = None,
+    optimization_level: int = 0,
+    reuse_ancillas: bool | None = None,
 ) -> LoweredCircuit:
     """Descriptive alias used by frontend integrations."""
 
-    return lower_ssa(function, function_name=function_name)
+    return lower_ssa(
+        function,
+        function_name=function_name,
+        optimization_level=optimization_level,
+        reuse_ancillas=reuse_ancillas,
+    )
 
 
 # Descriptive spellings used by small integrations and examples.

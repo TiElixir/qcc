@@ -505,14 +505,21 @@ def _find_frontend_callable() -> Callable[..., Any]:
     )
 
 
-def compile_c(source_or_path: Any, function: str | None = "main", opt: int = 1) -> Any:
+def compile_c(
+    source_or_path: Any,
+    function: str | None = "main",
+    opt: int = 1,
+    *,
+    reuse_ancillas: bool | None = None,
+) -> Any:
     """Compile C source text or a C path into a reversible :class:`Circuit`.
 
-    ``function`` selects the fixed-width SSA function emitted by the frontend.
-    Levels zero and one retain the v0.3 circuit stream; levels two and three
-    run the v0.4 SSA and gate passes after frontend/lowering work completes.
-    The frontend and netlist implementations are imported lazily so callers
-    can use the lowering package independently in tests.
+    ``function`` selects the fixed-width SSA function emitted by the frontend;
+    ``opt`` is passed through as the frontend's optimization level. Level 2
+    enables conservative SSA/gate optimization and clean-ancilla reuse unless
+    ``reuse_ancillas`` is explicitly supplied. The frontend and netlist
+    implementations are imported lazily so callers can use the lowering
+    package independently in tests.
     """
 
     normalized_opt = normalize_level(opt)
@@ -525,7 +532,12 @@ def compile_c(source_or_path: Any, function: str | None = "main", opt: int = 1) 
         selected_ssa = (
             optimize_ssa(source_or_path, normalized_opt) if enabled else source_or_path
         )
-        lowered = lower_ssa(selected_ssa, function_name=function)
+        lowered = lower_ssa(
+            selected_ssa,
+            function_name=function,
+            optimization_level=normalized_opt,
+            reuse_ancillas=reuse_ancillas,
+        )
         circuit = _construct_circuit(lowered)
         return (
             optimize_circuit(circuit, normalized_opt)
@@ -546,7 +558,12 @@ def compile_c(source_or_path: Any, function: str | None = "main", opt: int = 1) 
         return selected
     if enabled:
         selected = optimize_ssa(selected, normalized_opt)
-    lowered = lower_ssa(selected, function_name=function)
+    lowered = lower_ssa(
+        selected,
+        function_name=function,
+        optimization_level=normalized_opt,
+        reuse_ancillas=reuse_ancillas,
+    )
     circuit = _construct_circuit(lowered)
     if enabled and isinstance(circuit, Circuit):
         return optimize_circuit(circuit, normalized_opt)

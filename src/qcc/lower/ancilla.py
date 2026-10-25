@@ -102,15 +102,28 @@ class CircuitLayout:
 
 
 class AncillaAllocator:
-    """Allocate disjoint input, value, output, and clean-ancilla registers."""
+    """Allocate disjoint input, value, output, and clean-ancilla registers.
 
-    def __init__(self, *, first_qubit: int = 0) -> None:
+    The default allocator is monotonic and is the v0.3 lowering baseline.  A
+    reusable allocator can be requested for a lifetime-aware lowering pass;
+    released non-input/non-output registers are then leased again by width.
+    Physical bits remain unique in the final layout even when several logical
+    register leases used them over time.
+    """
+
+    def __init__(self, *, first_qubit: int = 0, reuse: bool = False) -> None:
         if first_qubit < 0:
             raise AllocationError("first qubit cannot be negative")
         self._next_qubit = first_qubit
         self._registers: list[Register] = []
         self._inputs: dict[str, Register] = {}
         self._used_names: set[str] = set()
+        self._reuse = bool(reuse)
+        self._free: dict[int, list[tuple[int, ...]]] = {}
+        self._active: dict[tuple[int, ...], Register] = {}
+        self._physical_bits: list[tuple[int, ...]] = []
+        self._physical_kinds: dict[tuple[int, ...], str] = {}
+        self._allocation_events: list[Register] = []
 
     def _allocate(self, width: int, name: str, kind: str) -> Register:
         if width <= 0:
@@ -119,11 +132,20 @@ class AncillaAllocator:
             raise AllocationError("register name cannot be empty")
         if name in self._used_names:
             raise AllocationError(f"register name {name!r} is already allocated")
-        bits = tuple(range(self._next_qubit, self._next_qubit + width))
-        self._next_qubit += width
+        reusable = self._reuse and kind not in {"input", "output"}
+        available = self._free.get(width, []) if reusable else []
+        if available:
+            bits = available.pop(0)
+        else:
+            bits = tuple(range(self._next_qubit, self._next_qubit + width))
+            self._next_qubit += width
+            self._physical_bits.append(bits)
+            self._physical_kinds[bits] = kind
         register = Register(name=name, width=width, bits=bits, kind=kind)
         self._registers.append(register)
+        self._allocation_events.append(register)
         self._used_names.add(name)
+        self._active[bits] = register
         return register
 
     def allocate_input(self, name: str, width: int) -> Register:
@@ -158,6 +180,55 @@ class AncillaAllocator:
         return self._allocate(width, name, "output")
 
     @property
+    def reuse_enabled(self) -> bool:
+        """Whether released temporary registers may be leased again."""
+
+        return self._reuse
+
+    def allocation_mark(self) -> int:
+        """Return a token for allocations made after this point."""
+
+        return len(self._allocation_events)
+
+    def allocations_since(self, mark: int) -> tuple[Register, ...]:
+        """Return register leases created after ``mark``."""
+
+        if mark < 0 or mark > len(self._allocation_events):
+            raise AllocationError("invalid allocation mark")
+        return tuple(self._allocation_events[mark:])
+
+    def release(self, register: Register) -> None:
+        """Return a clean temporary lease to the reusable allocator.
+
+        Release is intentionally unavailable on the monotonic baseline.  The
+        optimized lowering path only calls it after appending the inverse of
+        the register's producer, so a released lease is known to be clean.
+        """
+
+        if not self._reuse:
+            raise AllocationError("register release requires a reusable allocator")
+        if register.kind in {"input", "output"}:
+            raise AllocationError(f"cannot release {register.kind} register")
+        active = self._active.get(register.bits)
+        if active != register:
+            raise AllocationError(f"register {register.name!r} is not an active lease")
+        del self._active[register.bits]
+        available = self._free.setdefault(register.width, [])
+        if register.bits not in available:
+            available.append(register.bits)
+            available.sort()
+
+    @property
+    def active_registers(self) -> tuple[Register, ...]:
+        """Return currently live register leases in allocation order."""
+
+        return tuple(
+            register
+            for register in self._registers
+            if self._active.get(register.bits) == register
+        )
+
+    @property
     def next_qubit(self) -> int:
         return self._next_qubit
 
@@ -180,9 +251,9 @@ class AncillaAllocator:
             raise AllocationError("layout output must be an output register")
         ancillas = tuple(
             bit
-            for register in self._registers
-            if register.kind not in {"input", "output"}
-            for bit in register.bits
+            for bits in self._physical_bits
+            if self._physical_kinds[bits] not in {"input", "output"}
+            for bit in bits
         )
         return CircuitLayout(
             inputs={name: register.bits for name, register in self._inputs.items()},
