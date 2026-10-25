@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import qcc
+from qcc.sim.classical import assign_inputs, batch_simulate, read_register
 from v02_helpers import (
     assert_inverse_restores,
     assert_output_and_clean,
@@ -50,11 +51,19 @@ def test_binary_arithmetic_matches_native_for_every_16_bit_input(
         ctypes.c_uint8,
     )
     circuit = _circuit(function)
-    for a in range(256):
-        for b in range(256):
-            expected = _binary_expected(function, a, b)
-            assert int(native(a, b)) == expected
-            assert_output_and_clean(circuit, {"a": a, "b": b}, expected)
+    cases = tuple((a, b) for a in range(256) for b in range(256))
+    states = batch_simulate(
+        circuit,
+        (assign_inputs(circuit, {"a": a, "b": b}) for a, b in cases),
+        check_ancillas=False,
+    )
+    for (a, b), state in zip(cases, states, strict=True):
+        expected = _binary_expected(function, a, b)
+        assert int(native(a, b)) == expected
+        assert read_register(state, circuit.layout.output) == expected
+        assert all(
+            ((state >> int(qubit)) & 1) == 0 for qubit in circuit.layout.ancillas
+        )
 
 
 CLAMP_SAMPLES = (

@@ -10,6 +10,7 @@ import pytest
 
 import qcc
 from qcc.errors import CompilerError
+from qcc.sim.classical import assign_inputs, batch_simulate, read_register
 from v02_helpers import (
     assert_inverse_restores,
     assert_output_and_clean,
@@ -42,11 +43,19 @@ def test_multiply8_matches_native_for_every_16_bit_input(
     )
     circuit = _circuit("multiply8")
 
-    for left in range(256):
-        for right in range(256):
-            expected = left * right
-            assert int(native(left, right)) == expected
-            assert_output_and_clean(circuit, {"a": left, "b": right}, expected)
+    cases = tuple((left, right) for left in range(256) for right in range(256))
+    states = batch_simulate(
+        circuit,
+        (assign_inputs(circuit, {"a": left, "b": right}) for left, right in cases),
+        check_ancillas=False,
+    )
+    for (left, right), state in zip(cases, states, strict=True):
+        expected = left * right
+        assert int(native(left, right)) == expected
+        assert read_register(state, circuit.layout.output) == expected
+        assert all(
+            ((state >> int(qubit)) & 1) == 0 for qubit in circuit.layout.ancillas
+        )
 
 
 @pytest.mark.parametrize(

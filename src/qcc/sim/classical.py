@@ -321,6 +321,66 @@ def simulate(
     return state
 
 
+def batch_simulate(
+    circuit: Circuit,
+    initial_states: Iterable[int],
+    *,
+    check_ancillas: bool = True,
+    ancillas: Iterable[QubitLike] | str | None = None,
+) -> tuple[int, ...]:
+    """Simulate many basis states with bit-sliced reversible gates.
+
+    Each Python integer in the returned tuple is one complete final wire state.
+    Internally, one bit of a wire mask represents one input lane, so exhaustive
+    differential tests can run a gate stream once for all lanes without
+    changing the scalar simulator's semantics.
+    """
+
+    if not isinstance(circuit, Circuit):
+        raise TypeError("batch_simulate expects a Circuit")
+    states = tuple(int(state) for state in initial_states)
+    width = circuit.num_qubits
+    for state in states:
+        if state < 0 or state >= (1 << width):
+            raise ValueError("initial state does not fit in the circuit width")
+    if not states:
+        return ()
+
+    lane_mask = (1 << len(states)) - 1
+    wires = [0] * width
+    for lane, state in enumerate(states):
+        remaining = state
+        lane_bit = 1 << lane
+        while remaining:
+            bit = remaining & -remaining
+            wires[bit.bit_length() - 1] |= lane_bit
+            remaining ^= bit
+
+    for gate in circuit.gates:
+        target = int(gate.target)
+        if gate.op == "X":
+            wires[target] ^= lane_mask
+            continue
+        condition = lane_mask
+        for control in gate.controls:
+            condition &= wires[int(control)]
+        wires[target] ^= condition
+
+    final_states = tuple(
+        sum((1 << qubit) if (wires[qubit] >> lane) & 1 else 0 for qubit in range(width))
+        for lane in range(len(states))
+    )
+    declared_ancillas = _resolve_ancillas(circuit, ancillas)
+    if check_ancillas:
+        for state in final_states:
+            dirty = tuple(
+                qubit for qubit in declared_ancillas if (state >> int(qubit)) & 1
+            )
+            if dirty:
+                raise AncillaDirtyError(declared_ancillas, state)
+    return final_states
+
+
 def simulate_with_trace(
     circuit: Circuit,
     inputs: Mapping[str | int, object] | int | None = None,
@@ -371,6 +431,7 @@ __all__ = [
     "assign_inputs",
     "assign_register",
     "assign_registers",
+    "batch_simulate",
     "pack_register",
     "read_register",
     "read_registers",

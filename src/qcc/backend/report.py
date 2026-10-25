@@ -32,6 +32,11 @@ class ResourceReport:
     mcx: int = 0
     mcx_cnot: int = 0
     optimizer: int | None = None
+    requested_level: int | None = None
+    effective_level: int | None = None
+    fallback_reason: str | None = None
+    before: Mapping[str, Any] | None = None
+    after: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         estimate = self.toffoli if self.toffoli_estimate < 0 else self.toffoli_estimate
@@ -44,6 +49,16 @@ class ResourceReport:
             or self.optimizer < 0
         ):
             raise ValueError("optimizer level must be a non-negative integer")
+        for name, level in (
+            ("requested_level", self.requested_level),
+            ("effective_level", self.effective_level),
+        ):
+            if level is not None and (
+                isinstance(level, bool) or not isinstance(level, int) or level < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.effective_level is None and self.optimizer is not None:
+            object.__setattr__(self, "effective_level", self.optimizer)
         object.__setattr__(self, "toffoli_estimate", estimate)
         object.__setattr__(self, "t_count", t_count)
 
@@ -52,6 +67,18 @@ class ResourceReport:
         """The optimizer level recorded on the source circuit, if any."""
 
         return self.optimizer
+
+    @property
+    def requested_optimization_level(self) -> int | None:
+        """The level requested by the compiler, if this is a compilation report."""
+
+        return self.requested_level
+
+    @property
+    def effective_optimization_level(self) -> int | None:
+        """The level represented by the selected/after circuit."""
+
+        return self.effective_level
 
     @property
     def num_qubits(self) -> int:
@@ -137,8 +164,8 @@ class ResourceReport:
             "t_count": self.t_count,
         }
 
-    def as_dict(self) -> dict[str, int]:
-        legacy = {
+    def as_dict(self) -> dict[str, Any]:
+        legacy: dict[str, Any] = {
             "qubits": self.qubits,
             "ancillas": self.ancillas,
             "gates": self.gates,
@@ -147,7 +174,7 @@ class ResourceReport:
             "ccx": self.toffoli,
             "depth": self.depth,
         }
-        if self.mcx:
+        if self.mcx or self.optimizer is not None or self.requested_level is not None:
             legacy.update(
                 {
                     "mcx": self.mcx,
@@ -159,6 +186,16 @@ class ResourceReport:
             )
         if self.optimizer is not None:
             legacy["optimizer"] = self.optimizer
+        if self.requested_level is not None:
+            legacy["requested_level"] = self.requested_level
+        if self.effective_level is not None:
+            legacy["effective_level"] = self.effective_level
+        if self.fallback_reason is not None:
+            legacy["fallback_reason"] = self.fallback_reason
+        if self.before is not None:
+            legacy["before"] = dict(self.before)
+        if self.after is not None:
+            legacy["after"] = dict(self.after)
         return legacy
 
 
@@ -292,7 +329,67 @@ def _depth(gates: Iterable[Any]) -> int:
     return depth
 
 
-def resource_report(circuit: Any, *, optimizer: int | None = None) -> ResourceReport:
+def _requested_level(circuit: Any) -> int | None:
+    value = _attribute(
+        circuit,
+        ("requested_optimization_level", "requested_level"),
+        None,
+    )
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _primitive_snapshot(circuit: Any, logical: ResourceReport) -> dict[str, Any]:
+    primitive = circuit
+    decompose = getattr(circuit, "decompose_mcx", None)
+    if callable(decompose) and logical.mcx:
+        try:
+            primitive = decompose()
+        except (TypeError, ValueError):
+            primitive = None
+
+    if primitive is not None and primitive is not circuit:
+        gates = _gates(primitive)
+        counts = {"x": 0, "cx": 0, "ccx": 0}
+        for gate in gates:
+            name = _gate_name(gate)
+            if name in counts:
+                counts[name] += 1
+        primitive_depth = _depth(gates)
+        primitive_gate_count = len(gates)
+        primitive_t_count = 7 * counts["ccx"]
+    else:
+        counts = {
+            "x": logical.x,
+            "cx": logical.cnot + logical.mcx_cnot,
+            "ccx": logical.toffoli_estimate,
+        }
+        primitive_depth = logical.depth
+        primitive_gate_count = logical.primitive_gate_count
+        primitive_t_count = logical.t_count
+
+    return {
+        "qubit_count": logical.qubits,
+        "ancillas": logical.ancillas,
+        "gate_count": primitive_gate_count,
+        "gate_counts": counts,
+        "depth": primitive_depth,
+        "t_count": primitive_t_count,
+    }
+
+
+def resource_report(
+    circuit: Any,
+    *,
+    optimizer: int | None = None,
+    requested_level: int | None = None,
+    before: Any | None = None,
+    fallback_reason: str | None = None,
+    _include_metadata: bool = True,
+) -> ResourceReport:
     """Return resource counts without requiring a specific netlist class."""
 
     gates = _gates(circuit)
@@ -312,7 +409,13 @@ def resource_report(circuit: Any, *, optimizer: int | None = None) -> ResourceRe
             else:
                 mcx_toffolis += _mcx_toffoli_cost(gate)
     toffoli_estimate = counts["ccx"] + mcx_toffolis
-    return ResourceReport(
+    effective_level = _optimizer_level(circuit) if optimizer is None else optimizer
+    requested = (
+        _requested_level(circuit) if requested_level is None else requested_level
+    )
+    if requested is None and optimizer is not None:
+        requested = optimizer
+    result = ResourceReport(
         qubits=_num_qubits(circuit, gates),
         ancillas=_ancilla_count(circuit),
         gates=len(gates),
@@ -324,8 +427,26 @@ def resource_report(circuit: Any, *, optimizer: int | None = None) -> ResourceRe
         toffoli_estimate=toffoli_estimate,
         mcx=mcx_count,
         mcx_cnot=mcx_cnot,
-        optimizer=_optimizer_level(circuit) if optimizer is None else optimizer,
+        optimizer=effective_level,
+        requested_level=requested,
+        effective_level=effective_level,
+        fallback_reason=fallback_reason,
     )
+    if not _include_metadata:
+        return result
+
+    if requested is not None:
+        baseline_circuit = circuit if before is None else before
+        baseline = (
+            result
+            if before is None
+            else resource_report(before, _include_metadata=False)
+        )
+        object.__setattr__(
+            result, "before", _primitive_snapshot(baseline_circuit, baseline)
+        )
+        object.__setattr__(result, "after", _primitive_snapshot(circuit, result))
+    return result
 
 
 report_resources = resource_report

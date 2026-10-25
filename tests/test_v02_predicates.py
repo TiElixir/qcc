@@ -8,9 +8,9 @@ from pathlib import Path
 import pytest
 
 import qcc
+from qcc.sim.classical import assign_inputs, batch_simulate, read_register
 from v02_helpers import (
     assert_inverse_restores,
-    assert_output_and_clean,
     build_native_library,
     native_function,
 )
@@ -74,12 +74,20 @@ def test_all_icmp_predicates_match_native_for_every_16_bit_input(
         (ctypes.c_uint8, ctypes.c_uint8),
         ctypes.c_uint16,
     )
-    for a in range(256):
-        for b in range(256):
-            expected = _expected_mask(a, b)
-            native_result = int(native(a, b))
-            assert native_result == expected
-            assert_output_and_clean(circuit, {"a": a, "b": b}, expected)
+    cases = tuple((a, b) for a in range(256) for b in range(256))
+    states = batch_simulate(
+        circuit,
+        (assign_inputs(circuit, {"a": a, "b": b}) for a, b in cases),
+        check_ancillas=False,
+    )
+    for (a, b), state in zip(cases, states, strict=True):
+        expected = _expected_mask(a, b)
+        native_result = int(native(a, b))
+        assert native_result == expected
+        assert read_register(state, circuit.layout.output) == expected
+        assert all(
+            ((state >> int(qubit)) & 1) == 0 for qubit in circuit.layout.ancillas
+        )
 
 
 def test_icmp_circuit_inverse_restores_deterministic_basis_states(

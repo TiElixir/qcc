@@ -48,10 +48,23 @@ The same `add` command returns a resource report like this:
 
 ```json
 {
+  "after": {
+    "ancillas": 17,
+    "depth": 170,
+    "gate_count": 248,
+    "gate_counts": {
+      "ccx": 64,
+      "cx": 184,
+      "x": 0
+    },
+    "qubit_count": 41,
+    "t_count": 448
+  },
   "ancillas": 17,
   "ccx": 64,
   "cx": 184,
   "depth": 170,
+  "effective_level": 0,
   "gate_count": 248,
   "gate_counts": {
     "ccx": 64,
@@ -59,9 +72,26 @@ The same `add` command returns a resource report like this:
   },
   "gates": 248,
   "mcx": 0,
-  "optimizer": null,
+  "mcx_cx": 0,
+  "optimizer": 0,
+  "primitive_gates": 248,
   "qubit_count": 41,
   "qubits": 41,
+  "requested_level": 0,
+  "before": {
+    "ancillas": 17,
+    "depth": 170,
+    "gate_count": 248,
+    "gate_counts": {
+      "ccx": 64,
+      "cx": 184,
+      "x": 0
+    },
+    "qubit_count": 41,
+    "t_count": 448
+  },
+  "t_count": 448,
+  "toffoli_estimate": 64,
   "x": 0
 }
 ```
@@ -71,9 +101,9 @@ estimated T-count fields.
 
 The resource command prints JSON with fields including `qubit_count`,
 `ancillas`, `depth`, `gate_count`, and `gate_counts`. Exact counts are
-schedule-dependent. v0.3 also defines the post-MCX-decomposition CCX count
-and a derived T-count estimate; this documentation does not claim those
-v0.3 results have been produced in the current checkout.
+schedule-dependent. The Python report also exposes the post-MCX-decomposition
+CCX count and derived T-count estimate; v0.4 O0/O2 measurements are recorded in
+`docs/benchmarks.md`.
 
 The required predicate can be requested with the same CLI shape:
 

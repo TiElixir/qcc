@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import qcc
+from qcc.sim.classical import assign_inputs, batch_simulate, read_register
 from v02_helpers import (
     assert_inverse_restores,
     assert_output_and_clean,
@@ -57,11 +58,19 @@ def test_nested_if_else_matches_native_for_every_16_bit_input(
         ctypes.c_uint8,
     )
     circuit = _circuit("nested_if_else")
-    for x in range(256):
-        for y in range(256):
-            expected = _nested_expected(x, y)
-            assert int(native(x, y)) == expected
-            assert_output_and_clean(circuit, {"x": x, "y": y}, expected)
+    cases = tuple((x, y) for x in range(256) for y in range(256))
+    states = batch_simulate(
+        circuit,
+        (assign_inputs(circuit, {"x": x, "y": y}) for x, y in cases),
+        check_ancillas=False,
+    )
+    for (x, y), state in zip(cases, states, strict=True):
+        expected = _nested_expected(x, y)
+        assert int(native(x, y)) == expected
+        assert read_register(state, circuit.layout.output) == expected
+        assert all(
+            ((state >> int(qubit)) & 1) == 0 for qubit in circuit.layout.ancillas
+        )
 
 
 def test_constant_shifts_match_native_for_every_uint8_input(

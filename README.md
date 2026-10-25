@@ -16,9 +16,10 @@ X/CX/CCX networks, and can emit OpenQASM 3. The project is designed to make
 its boundaries and resource costs explicit rather than to behave like a
 general-purpose C compiler.
 
-## Status: v0.4 complete; release tag pending
+## Status: v0.4 complete; v0.4.0 tagged
 
-v0.3 is complete and tagged `v0.3.0`. This checkout adds v0.4 optimizer levels
+v0.3 is complete and tagged `v0.3.0`, and the v0.4 milestone is tagged
+`v0.4.0`. This checkout adds v0.4 optimizer levels
 O0/O1/O2, semantics-preserving SSA and peephole passes, lifetime-based eager
 cleanup, conservative clean-ancilla reuse, invariant tests, and measured
 benchmark rows in [docs/benchmarks.md](docs/benchmarks.md). O0 remains the
@@ -79,10 +80,23 @@ The same `add` command returns a resource report like this:
 
 ```json
 {
+  "after": {
+    "ancillas": 17,
+    "depth": 170,
+    "gate_count": 248,
+    "gate_counts": {
+      "ccx": 64,
+      "cx": 184,
+      "x": 0
+    },
+    "qubit_count": 41,
+    "t_count": 448
+  },
   "ancillas": 17,
   "ccx": 64,
   "cx": 184,
   "depth": 170,
+  "effective_level": 0,
   "gate_count": 248,
   "gate_counts": {
     "ccx": 64,
@@ -90,14 +104,44 @@ The same `add` command returns a resource report like this:
   },
   "gates": 248,
   "mcx": 0,
-  "optimizer": null,
+  "mcx_cx": 0,
+  "optimizer": 0,
+  "primitive_gates": 248,
   "qubit_count": 41,
   "qubits": 41,
+  "requested_level": 0,
+  "before": {
+    "ancillas": 17,
+    "depth": 170,
+    "gate_count": 248,
+    "gate_counts": {
+      "ccx": 64,
+      "cx": 184,
+      "x": 0
+    },
+    "qubit_count": 41,
+    "t_count": 448
+  },
+  "t_count": 448,
+  "toffoli_estimate": 64,
   "x": 0
 }
 ```
 
-The Python `Circuit.report()` API additionally exposes the post-decomposition
+The Python API exposes the same report and convenience adapters:
+
+```python
+import qcc
+
+circuit = qcc.compile_c(source="...", function="is_solution", opt=2)
+report = circuit.report()
+qasm = circuit.to_qasm3()
+result = circuit.simulate({"x": 5})
+```
+
+`result` is a mapping of named registers plus an `ancillas` qubit-to-bit
+mapping. `circuit.to_qiskit()` is available when the optional Qiskit extra is
+installed. The Python report additionally exposes the post-decomposition
 Toffoli count and estimated T count.
 
 `qcc stats` reports JSON fields such as `qubit_count`, `ancillas`, `depth`,

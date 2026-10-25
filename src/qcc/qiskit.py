@@ -117,6 +117,9 @@ def to_quantum_circuit(circuit: Any) -> Any:
     return result
 
 
+to_qiskit = to_quantum_circuit
+
+
 def statevector(circuit: Any) -> Any:
     """Run a Qiskit circuit with its exact statevector simulator."""
 
@@ -224,5 +227,6 @@ __all__ = [
     "qiskit_available",
     "run_aer",
     "statevector",
+    "to_qiskit",
     "to_quantum_circuit",
 ]

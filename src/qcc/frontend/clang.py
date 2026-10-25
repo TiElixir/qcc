@@ -156,8 +156,8 @@ def compile_c(
         input_argument = "-"
         stdin_text = source if isinstance(source, str) else os.fspath(source)
 
-    if opt < 0 or opt > 3:
-        raise ValueError("opt must be between 0 and 3")
+    if opt < 0 or opt > 2:
+        raise ValueError("opt must be between 0 and 2")
     optimization_flag = f"-O{max(1, opt)}"
     flags = [
         optimization_flag,

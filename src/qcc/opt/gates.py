@@ -43,8 +43,8 @@ def normalize_level(level: int) -> int:
     """Validate and normalize a public qcc optimization level.
 
     Levels zero and one retain the v0.3 circuit stream.  Level two is the
-    v0.4 optimizer, and level three is accepted as a forward-compatible alias
-    for the same deterministic pass.
+    v0.4 optimizer.  Levels above two are intentionally rejected because the
+    v0.4 contract has no semantics for them.
     """
 
     if isinstance(level, bool):
@@ -53,8 +53,8 @@ def normalize_level(level: int) -> int:
         normalized = _index(level)
     except TypeError as exc:
         raise TypeError("optimization level must be an integer") from exc
-    if normalized < 0 or normalized > 3:
-        raise ValueError("optimization level must be between 0 and 3")
+    if normalized < 0 or normalized > 2:
+        raise ValueError("optimization level must be between 0 and 2")
     return normalized
 
 
@@ -233,6 +233,8 @@ def optimize_circuit(
         domain=circuit.domain,
         name=circuit.name,
         optimization_level=normalized,
+        requested_optimization_level=normalized,
+        baseline=circuit,
     )
 
 

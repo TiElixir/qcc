@@ -4,6 +4,7 @@ from qcc import CircuitBuilder, CircuitLayout, Gate, QubitAllocator
 from qcc.sim.classical import (
     AncillaDirtyError,
     assign_inputs,
+    batch_simulate,
     read_register,
     simulate,
 )
@@ -25,6 +26,10 @@ def test_primitive_gates_and_mcx_simulate_as_bit_masks():
         "ccx": 1,
         "mcx": 1,
     }
+    initial_states = tuple(range(8))
+    assert batch_simulate(circuit, initial_states, check_ancillas=False) == tuple(
+        simulate(circuit, initial) for initial in initial_states
+    )
 
 
 def test_inverse_is_reverse_gate_order_and_composition_cleans_state():
@@ -50,6 +55,14 @@ def test_layout_is_lsb_first_and_ancillas_are_checked():
     with pytest.raises(AncillaDirtyError) as error:
         simulate(dirty)
     assert error.value.dirty == (3,)
+
+
+def test_direct_mcx_decomposition_rejects_workspace_touched_earlier():
+    layout = CircuitLayout({"data": (0, 1, 2, 3)}, ancillas=(4,), num_qubits=5)
+    circuit = CircuitBuilder(5, layout=layout).x(4).mcx((0, 1, 2), 3).build()
+
+    with pytest.raises(ValueError, match="clean ancilla"):
+        circuit.decompose_mcx()
 
 
 def test_invalid_operands_and_allocator_domains_are_rejected():

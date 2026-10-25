@@ -76,9 +76,8 @@ pytest -q
 
 ### v0.4 — optimization contract and measured resource reporting
 
-**Status:** Complete; optimizer implementation, invariant tests, and measured
-O0/O2 benchmark rows are integrated. The release tag is pending the final
-release-gate commit.
+**Status:** Complete and tagged `v0.4.0`; optimizer implementation, invariant
+tests, and measured O0/O2 benchmark rows are integrated.
 
 1. Implement optimizer levels O0, O1, and O2. O0 retains the v0.3 Bennett
    baseline; O1 adds safe SSA/peephole simplification; O2 adds proven

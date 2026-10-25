@@ -23,7 +23,14 @@ from qcc.lib.shift import (
     shift_right,
 )
 from qcc.lower.bennett import GateBuffer
-from qcc.sim.classical import read_register, simulate
+from qcc.sim.classical import batch_simulate, read_register, simulate
+
+
+def _fast_simulate(circuit: object, initial: int) -> int:
+    fast_simulator = getattr(circuit, "fast_simulate", None)
+    if callable(fast_simulator):
+        return int(fast_simulator(initial))
+    return int(simulate(circuit, initial, check_ancillas=False))  # type: ignore[arg-type]
 
 
 def _registers(width: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -65,7 +72,7 @@ def test_comparison_predicates_are_exhaustive_for_widths_one_through_six(
         circuit, left, right, flag, ancillas = _comparison_circuit(width, predicate)
         for left_value, right_value in product(range(1 << width), repeat=2):
             initial = left_value | (right_value << width)
-            result = simulate(circuit, initial=initial)
+            result = _fast_simulate(circuit, initial)
             assert read_register(result, left) == left_value
             assert read_register(result, right) == right_value
             assert ((result >> flag) & 1) == int(reference(left_value, right_value))
@@ -89,7 +96,7 @@ def test_comparison_flags_can_be_built_together_exhaustively() -> None:
         )
         circuit = builder.build()
         for left_value, right_value in product(range(1 << width), repeat=2):
-            result = simulate(circuit, left_value | (right_value << width))
+            result = _fast_simulate(circuit, left_value | (right_value << width))
             assert ((result >> less) & 1) == int(left_value < right_value)
             assert ((result >> equal) & 1) == int(left_value == right_value)
             assert ((result >> greater) & 1) == int(left_value > right_value)
@@ -103,7 +110,7 @@ def test_comparison_flags_are_xor_targets_and_gatebuffer_compatible() -> None:
     unsigned_less_than(builder, left, right, flag, ancillas)
     circuit = builder.build()
     # With a dirty output target, the predicate is XORed into the old bit.
-    assert ((simulate(circuit, (1 << 1) | (1 << flag)) >> flag) & 1) == 0
+    assert ((_fast_simulate(circuit, (1 << 1) | (1 << flag)) >> flag) & 1) == 0
 
     buffer = GateBuffer()
     returned = unsigned_less_than(buffer, left, right, flag, ancillas)
@@ -131,7 +138,7 @@ def test_select_is_exhaustive_for_all_condition_and_data_values() -> None:
                 | (true_value << (width + 1))
                 | (old_result << (2 * width + 1))
             )
-            final = simulate(circuit, initial)
+            final = _fast_simulate(circuit, initial)
             expected = old_result ^ (true_value if condition_value else false_value)
             assert read_register(final, result_register) == expected
             assert read_register(final, when_false) == false_value
@@ -146,15 +153,25 @@ def test_controlled_xor_result_is_exhaustive_for_widths_one_through_six() -> Non
         builder = CircuitBuilder(2 * width + 1)
         controlled_xor_result(builder, condition, source, result_register)
         circuit = builder.build()
-        for condition_value, source_value, old_result in product(
-            range(2), range(1 << width), range(1 << width)
-        ):
-            initial = (
+        cases = tuple(
+            (condition_value, source_value, old_result)
+            for condition_value, source_value, old_result in product(
+                range(2), range(1 << width), range(1 << width)
+            )
+        )
+        finals = batch_simulate(
+            circuit,
+            (
                 (condition_value << condition)
                 | (source_value << 1)
                 | (old_result << (width + 1))
-            )
-            final = simulate(circuit, initial)
+                for condition_value, source_value, old_result in cases
+            ),
+            check_ancillas=False,
+        )
+        for (condition_value, source_value, old_result), final in zip(
+            cases, finals, strict=True
+        ):
             assert read_register(final, result_register) == (
                 old_result ^ (source_value if condition_value else 0)
             )

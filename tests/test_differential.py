@@ -9,7 +9,12 @@ import subprocess
 import pytest
 
 import qcc
-from qcc.sim.classical import read_register, read_registers, simulate
+from qcc.sim.classical import (
+    assign_inputs,
+    batch_simulate,
+    read_register,
+    read_registers,
+)
 
 SOURCE = r"""
 #include <stdint.h>
@@ -68,17 +73,21 @@ def test_all_uint8_binary_inputs_match_native(
     reference_function = reference
     assert callable(reference_function)
 
-    for a in range(256):
-        for b in range(256):
-            state = simulate(circuit, {"a": a, "b": b})
-            output = read_register(state, circuit.layout.output)
-            expected = int(reference_function(a, b))  # type: ignore[operator]
-            assert output == expected
-            assert output == int(native(a, b))
-            registers = read_registers(state, circuit)
-            assert registers["a"] == a
-            assert registers["b"] == b
-            assert all(((state >> qubit) & 1) == 0 for qubit in circuit.layout.ancillas)
+    cases = tuple((a, b) for a in range(256) for b in range(256))
+    states = batch_simulate(
+        circuit,
+        (assign_inputs(circuit, {"a": a, "b": b}) for a, b in cases),
+        check_ancillas=False,
+    )
+    for (a, b), state in zip(cases, states, strict=True):
+        output = read_register(state, circuit.layout.output)
+        expected = int(reference_function(a, b))  # type: ignore[operator]
+        assert output == expected
+        assert output == int(native(a, b))
+        registers = read_registers(state, circuit)
+        assert registers["a"] == a
+        assert registers["b"] == b
+        assert all(((state >> qubit) & 1) == 0 for qubit in circuit.layout.ancillas)
 
 
 def test_circuit_followed_by_reverse_restores_basis_state() -> None:

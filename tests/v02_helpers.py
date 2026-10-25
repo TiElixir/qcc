@@ -74,7 +74,12 @@ def assert_output_and_clean(
 ) -> int:
     """Check one result and explicitly verify every declared ancilla is zero."""
 
-    state = simulate(circuit, inputs)
+    initial = assign_inputs(circuit, inputs)
+    fast_simulator = getattr(circuit, "fast_simulate", None)
+    if callable(fast_simulator):
+        state = int(fast_simulator(initial))
+    else:
+        state = int(simulate(circuit, inputs, check_ancillas=False))
     output = read_register(state, _layout_output(circuit))
     assert output == expected
     layout = circuit.layout

@@ -521,6 +521,8 @@ class Circuit:
     domain: object | None
     name: str | None
     optimization_level: int | None = field(default=None, compare=False)
+    requested_optimization_level: int | None = field(default=None, compare=False)
+    baseline: Circuit | None = field(default=None, compare=False, repr=False)
     _compiled: tuple[tuple[int, int, int], ...] = field(
         init=False, repr=False, compare=False
     )
@@ -536,6 +538,8 @@ class Circuit:
         domain: object | None = None,
         name: str | None = None,
         optimization_level: int | None = None,
+        requested_optimization_level: int | None = None,
+        baseline: Circuit | None = None,
     ) -> None:
         # ``Circuit(4)`` is a useful empty-circuit shorthand.
         if isinstance(gates, int) and num_qubits is None:
@@ -589,6 +593,20 @@ class Circuit:
         ):
             raise ValueError("optimization level must be a non-negative integer")
         object.__setattr__(self, "optimization_level", optimization_level)
+        if requested_optimization_level is not None and (
+            isinstance(requested_optimization_level, bool)
+            or not isinstance(requested_optimization_level, int)
+            or requested_optimization_level < 0
+        ):
+            raise ValueError(
+                "requested optimization level must be a non-negative integer"
+            )
+        object.__setattr__(
+            self, "requested_optimization_level", requested_optimization_level
+        )
+        if baseline is not None and not isinstance(baseline, Circuit):
+            raise TypeError("baseline must be a qcc Circuit")
+        object.__setattr__(self, "baseline", baseline)
         compiled: list[tuple[int, int, int]] = []
         operation_codes = {"X": 0, "CX": 1, "CCX": 2, "MCX": 3}
         for gate in gate_tuple:
@@ -656,6 +674,42 @@ class Circuit:
         assert simulator is not None
         return simulator(state)
 
+    def simulate(self, inputs: Any = None, **kwargs: Any) -> dict[str, Any]:
+        """Simulate the circuit and return named registers and ancillas.
+
+        The lower-level :func:`qcc.sim.classical.simulate` helper returns the
+        complete integer wire state.  This method is the user-facing
+        structured result: named registers are returned by name and declared
+        ancillas are returned as a qubit-to-bit mapping.
+        """
+
+        from qcc.sim.classical import read_registers
+        from qcc.sim.classical import simulate as run_classical
+
+        result = run_classical(self, inputs, **kwargs)
+        state = result[0] if isinstance(result, tuple) else result
+        if self.layout is None:
+            return {"state": int(state)}
+        values: dict[str, Any] = read_registers(state, self)
+        values["ancillas"] = {
+            int(qubit): (state >> int(qubit)) & 1 for qubit in self.layout.ancillas
+        }
+        return values
+
+    def to_qasm3(self, *, layout: Any | None = None, validate: bool = True) -> str:
+        """Emit this circuit as validated OpenQASM 3 source."""
+
+        from qcc.backend.qasm3 import to_qasm3
+
+        return to_qasm3(self, layout=layout, validate=validate)
+
+    def to_qiskit(self) -> Any:
+        """Translate this circuit through the optional Qiskit adapter."""
+
+        from qcc.qiskit import to_quantum_circuit
+
+        return to_quantum_circuit(self)
+
     @property
     def qubits(self) -> tuple[int, ...]:
         return tuple(range(self.num_qubits))
@@ -682,6 +736,7 @@ class Circuit:
             layout=self.layout,
             domain=self.domain,
             name=self.name,
+            requested_optimization_level=self.requested_optimization_level,
         )
 
     def extend(self, gates: Iterable[Gate] | Circuit) -> Circuit:
@@ -692,6 +747,7 @@ class Circuit:
             layout=self.layout,
             domain=self.domain,
             name=self.name,
+            requested_optimization_level=self.requested_optimization_level,
         )
 
     def compose(self, other: Circuit) -> Circuit:
@@ -735,6 +791,8 @@ class Circuit:
             domain=self.domain,
             name=self.name,
             optimization_level=self.optimization_level,
+            requested_optimization_level=self.requested_optimization_level,
+            baseline=self.baseline,
         )
 
     def decompose_mcx(self) -> Circuit:
@@ -748,25 +806,41 @@ class Circuit:
         if not any(gate.op == "MCX" for gate in self.gates):
             return self
         ancillas = () if self.layout is None else tuple(self.layout.ancillas)
+        ancilla_set = {int(qubit) for qubit in ancillas}
+        touched_ancillas: set[int] = set()
         expanded: list[Gate] = []
         for gate in self.gates:
             if gate.op != "MCX":
                 expanded.append(gate)
+                touched_ancillas.update(
+                    int(qubit) for qubit in gate.qubits if int(qubit) in ancilla_set
+                )
                 continue
             controls = tuple(gate.controls)
             target = gate.target
             if len(controls) == 1:
                 expanded.append(Gate.cx(controls[0], target))
+                touched_ancillas.update(
+                    int(qubit) for qubit in gate.qubits if int(qubit) in ancilla_set
+                )
                 continue
             if len(controls) == 2:
                 expanded.append(Gate.ccx(controls[0], controls[1], target))
+                touched_ancillas.update(
+                    int(qubit) for qubit in gate.qubits if int(qubit) in ancilla_set
+                )
                 continue
             required = len(controls) - 2
-            work = ancillas[:required]
+            operand_set = {int(operand) for operand in gate.qubits}
+            work = tuple(
+                qubit
+                for qubit in ancillas
+                if int(qubit) not in touched_ancillas and int(qubit) not in operand_set
+            )[:required]
             if len(work) != required:
                 raise ValueError(
                     f"MCX with {len(controls)} controls requires {required} "
-                    "clean ancilla qubits in the circuit layout"
+                    "clean ancilla qubits in the circuit layout at this point"
                 )
             operands = (*controls, target, *work)
             if len(set(operands)) != len(operands):
@@ -779,6 +853,9 @@ class Circuit:
             ladder.append(Gate.ccx(work[-1], controls[-1], target))
             expanded.extend(ladder)
             expanded.extend(reversed(ladder[:-1]))
+            touched_ancillas.update(
+                int(qubit) for qubit in gate.qubits if int(qubit) in ancilla_set
+            )
         return Circuit(
             tuple(expanded),
             num_qubits=self.num_qubits,
@@ -786,6 +863,8 @@ class Circuit:
             domain=self.domain,
             name=self.name,
             optimization_level=self.optimization_level,
+            requested_optimization_level=self.requested_optimization_level,
+            baseline=self.baseline,
         )
 
     invert = inverse
@@ -836,13 +915,28 @@ class Circuit:
 
         return self.optimization_level
 
+    @property
+    def requested_optimizer(self) -> int | None:
+        """Return the optimizer level requested by the compiler, if known."""
+
+        return self.requested_optimization_level
+
     def report(self, *, opt: int | None = None) -> Any:
         """Return the backend-neutral resource report for this circuit."""
 
         from qcc.backend.report import resource_report
+        from qcc.opt.gates import normalize_level
 
         target = self if opt is None else self.optimize(opt)
-        return resource_report(target)
+        return resource_report(
+            target,
+            requested_level=(
+                target.requested_optimization_level
+                if opt is None
+                else normalize_level(opt)
+            ),
+            before=target.baseline,
+        )
 
     resource_report = report
 

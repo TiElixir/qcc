@@ -49,6 +49,8 @@ def _optimization_level(value: str) -> int:
         ) from exc
     if level < 0:
         raise argparse.ArgumentTypeError("--opt expects a non-negative integer")
+    if level > 2:
+        raise argparse.ArgumentTypeError("--opt expects O0, O1, or O2")
     return level
 
 
@@ -336,9 +338,12 @@ def _qubit_operands(operation: Any) -> list[Any]:
 
 
 def _stats_from_result(result: Any, circuit: Any) -> dict[str, Any]:
-    supplied = _result_part(result, ("stats", "resources", "report"), default=None)
+    supplied = _result_part(result, ("stats", "report", "resources"), default=None)
     if callable(supplied):
         supplied = supplied()
+    as_dict = getattr(supplied, "as_dict", None)
+    if callable(as_dict):
+        supplied = as_dict()
     if isinstance(supplied, Mapping):
         stats: dict[str, Any] = {
             str(key): _jsonable(value) for key, value in supplied.items()

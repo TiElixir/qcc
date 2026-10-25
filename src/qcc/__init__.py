@@ -34,6 +34,7 @@ from qcc.opt.gates import (
 )
 from qcc.opt.ssa import constant_fold, dead_value_eliminate, optimize_ssa
 
+from .backend.qasm3 import to_qasm3
 from .backend.report import ResourceReport, resource_report
 from .lower.ancilla import CircuitLayout as _LoweringCircuitLayout
 from .lower.bennett import Gate as _LoweringGate
@@ -44,6 +45,9 @@ from .lower.ssa_to_rev import (
     UnsupportedSSAOperation,
     lower_ssa,
 )
+from .qiskit import to_quantum_circuit as to_qiskit
+
+_UNSET = object()
 
 
 def _load_netlist() -> tuple[Any | None, Any, Any]:
@@ -135,6 +139,18 @@ if _netlist_module is not None and hasattr(_BaseCircuitLayout, "registers"):
         @property
         def output(self) -> tuple[int, ...]:
             return tuple(self.registers.get("output", ()))
+
+        @property
+        def input_widths(self) -> Mapping[str, int]:
+            return {name: len(bits) for name, bits in self.inputs.items()}
+
+        @property
+        def output_width(self) -> int:
+            return len(self.output)
+
+        @property
+        def input_bits(self) -> tuple[int, ...]:
+            return tuple(bit for bits in self.inputs.values() for bit in bits)
 
     _layout_class: Any = _PublicCircuitLayout
 else:
@@ -276,6 +292,29 @@ def _construct_circuit(lowered: LoweredCircuit) -> Any:
             "could not construct the installed qcc Circuit; expected a "
             "from_gates factory or a (gates, num_qubits, layout) constructor"
         ) from exc
+
+
+def _record_optimization(
+    circuit: Any,
+    *,
+    requested: int,
+    effective: int,
+    baseline: Any | None = None,
+) -> Any:
+    """Attach v0.4 level metadata without constraining alternate backends."""
+
+    if not isinstance(circuit, Circuit):
+        return circuit
+    return Circuit(
+        circuit.gates,
+        num_qubits=circuit.num_qubits,
+        layout=circuit.layout,
+        domain=circuit.domain,
+        name=circuit.name,
+        optimization_level=effective,
+        requested_optimization_level=requested,
+        baseline=baseline,
+    )
 
 
 def _looks_like_circuit(value: Any) -> bool:
@@ -506,13 +545,18 @@ def _find_frontend_callable() -> Callable[..., Any]:
 
 
 def compile_c(
-    source_or_path: Any,
+    source_or_path: Any = _UNSET,
     function: str | None = "main",
     opt: int = 1,
     *,
+    source: Any = _UNSET,
     reuse_ancillas: bool | None = None,
 ) -> Any:
     """Compile C source text or a C path into a reversible :class:`Circuit`.
+
+    ``source_or_path`` is the positional/legacy spelling; ``source`` is an
+    equivalent keyword alias for callers that use the frontend's terminology.
+    Supplying both spellings is an error.
 
     ``function`` selects the fixed-width SSA function emitted by the frontend;
     ``opt`` is passed through as the frontend's optimization level. Level 2
@@ -521,6 +565,13 @@ def compile_c(
     implementations are imported lazily so callers can use the lowering
     package independently in tests.
     """
+
+    if source is not _UNSET:
+        if source_or_path is not _UNSET:
+            raise TypeError("compile_c() received both source and source_or_path")
+        source_or_path = source
+    elif source_or_path is _UNSET:
+        raise TypeError("compile_c() missing required argument: 'source'")
 
     normalized_opt = normalize_level(opt)
     effective_opt = 0 if reuse_ancillas is False else normalized_opt
@@ -540,10 +591,10 @@ def compile_c(
             reuse_ancillas=reuse_ancillas,
         )
         circuit = _construct_circuit(lowered)
-        return (
-            optimize_circuit(circuit, normalized_opt)
-            if enabled and isinstance(circuit, Circuit)
-            else circuit
+        if enabled and isinstance(circuit, Circuit):
+            return optimize_circuit(circuit, effective_opt)
+        return _record_optimization(
+            circuit, requested=normalized_opt, effective=effective_opt
         )
     frontend = _find_frontend_callable()
     _, _, source_path = _source_and_path(source_or_path)
@@ -556,7 +607,9 @@ def compile_c(
     if _looks_like_circuit(selected):
         if enabled and isinstance(selected, Circuit):
             return optimize_circuit(selected, effective_opt)
-        return selected
+        return _record_optimization(
+            selected, requested=normalized_opt, effective=effective_opt
+        )
     if enabled:
         selected = optimize_ssa(selected, effective_opt)
     lowered = lower_ssa(
@@ -568,7 +621,9 @@ def compile_c(
     circuit = _construct_circuit(lowered)
     if enabled and isinstance(circuit, Circuit):
         return optimize_circuit(circuit, effective_opt)
-    return circuit
+    return _record_optimization(
+        circuit, requested=normalized_opt, effective=effective_opt
+    )
 
 
 def _input_values(circuit: Any, inputs: Any) -> dict[str, int]:
@@ -665,6 +720,31 @@ def simulate(
         if not _looks_like_circuit(circuit_or_source)
         else circuit_or_source
     )
+
+    if _netlist_module is not None and isinstance(circuit, _circuit_type):
+        from qcc.sim.classical import read_register
+        from qcc.sim.classical import simulate as run_classical
+
+        layout = _attribute(circuit, ("layout",), None)
+        named_inputs = _attribute(layout, ("inputs",), None)
+        if isinstance(inputs, int) and not isinstance(named_inputs, Mapping):
+            final_state = run_classical(circuit, initial=inputs)
+        else:
+            values = _input_values(circuit, inputs)
+            final_state = run_classical(
+                circuit, cast(Mapping[str | int, object], values)
+            )
+        final_state = final_state[0] if isinstance(final_state, tuple) else final_state
+        output_bits = _attribute(layout, ("output",), None)
+        if output_bits is None:
+            registers = _attribute(layout, ("registers",), {})
+            output_bits = (
+                registers.get("output", ()) if isinstance(registers, Mapping) else ()
+            )
+        if output_bits:
+            return read_register(final_state, output_bits)
+        return int(final_state)
+
     method = getattr(circuit, "simulate", None)
     if callable(method):
         values = _input_values(circuit, inputs)
@@ -717,4 +797,6 @@ __all__ = [
     "lower_ssa",
     "resource_report",
     "simulate",
+    "to_qasm3",
+    "to_qiskit",
 ]

@@ -10,7 +10,17 @@ import qcc
 from qcc.errors import UnsupportedConstructError
 from qcc.frontend.llvm_parser import parse_module
 from qcc.lower import UnsupportedSSAOperation, lower_ssa
-from qcc.sim.classical import read_register, simulate
+from qcc.sim.classical import assign_inputs, batch_simulate, read_register
+
+
+def _batch_states(
+    circuit: object, inputs: tuple[dict[str, int], ...]
+) -> tuple[int, ...]:
+    return batch_simulate(
+        circuit,  # type: ignore[arg-type]
+        (assign_inputs(circuit, values) for values in inputs),  # type: ignore[arg-type]
+        check_ancillas=False,
+    )
 
 
 def _binary_function(opcode: str, width: int, rhs: object) -> dict[str, object]:
@@ -35,8 +45,13 @@ def test_mul_lowering_is_exhaustive_and_bennett_clean() -> None:
         function = _binary_function("mul", width, "%right")
         circuit = qcc.compile_c(function)
         mask = (1 << width) - 1
-        for left, right in product(range(1 << width), repeat=2):
-            state = simulate(circuit, {"left": left, "right": right})
+        cases = tuple(
+            {"left": left, "right": right}
+            for left, right in product(range(1 << width), repeat=2)
+        )
+        states = _batch_states(circuit, cases)
+        for values, state in zip(cases, states, strict=True):
+            left, right = values["left"], values["right"]
             assert read_register(state, circuit.layout.output) == (left * right) & mask
             assert all(((state >> qubit) & 1) == 0 for qubit in circuit.layout.ancillas)
 
@@ -47,8 +62,10 @@ def test_constant_mul_specialization_is_exhaustive() -> None:
             function = _binary_function("mul", width, constant)
             circuit = qcc.compile_c(function)
             mask = (1 << width) - 1
-            for left in range(1 << width):
-                state = simulate(circuit, {"left": left, "right": 0})
+            cases = tuple({"left": left, "right": 0} for left in range(1 << width))
+            states = _batch_states(circuit, cases)
+            for values, state in zip(cases, states, strict=True):
+                left = values["left"]
                 assert (
                     read_register(state, circuit.layout.output)
                     == (left * constant) & mask
@@ -64,8 +81,12 @@ def test_constant_udiv_and_urem_are_exhaustive_widths_one_through_six() -> None:
             for divisor in range(1, 1 << width):
                 function = _binary_function(opcode, width, divisor)
                 circuit = qcc.compile_c(function)
-                for value in range(1 << width):
-                    state = simulate(circuit, {"left": value, "right": 0})
+                cases = tuple(
+                    {"left": value, "right": 0} for value in range(1 << width)
+                )
+                states = _batch_states(circuit, cases)
+                for values, state in zip(cases, states, strict=True):
+                    value = values["left"]
                     expected = value // divisor if opcode == "udiv" else value % divisor
                     assert read_register(state, circuit.layout.output) == expected
                     assert all(
