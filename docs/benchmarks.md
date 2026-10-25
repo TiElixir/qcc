@@ -6,20 +6,20 @@ Resource columns are measured from the compiled circuit's `qcc.resource_report` 
 
 Compile time is the measured wall-clock duration of each real `qcc.compile_c` call, reported in milliseconds to three decimal places. It varies with the host and is not used to infer resource reductions.
 
-Rows are emitted in the fixed order `add`, `multiply`, `compare`, `popcount`, `is_solution`, with optimizer levels 0 and 2 adjacent. This v0.3 baseline has no integrated circuit optimizer, so identical O0/O2 resource rows are valid and no reduction is claimed.
+Rows are emitted in the fixed order `add`, `multiply`, `compare`, `popcount`, `is_solution`, with optimizer levels 0 and 2 adjacent. O0 is the v0.3 baseline; O2 enables the conservative v0.4 SSA, gate, and clean-ancilla reuse passes. Reductions are measured, not inferred.
 
 | Benchmark | Opt | Qubits | Ancillas | Gates | X | CX | CCX | MCX | Depth | T estimate | Compile time (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| add | 0 | 41 | 17 | 248 | 0 | 184 | 64 | 0 | 170 | 448 | 32.850 |
-| add | 2 | 41 | 17 | 248 | 0 | 184 | 64 | 0 | 170 | 448 | 23.729 |
-| multiply | 0 | 97 | 65 | 3664 | 0 | 592 | 2048 | 1024 | 3077 | 35840 | 41.424 |
-| multiply | 2 | 97 | 65 | 3664 | 0 | 592 | 2048 | 1024 | 3077 | 35840 | 46.758 |
-| compare | 0 | 49 | 25 | 214 | 92 | 78 | 30 | 14 | 44 | 504 | 27.131 |
-| compare | 2 | 49 | 25 | 214 | 92 | 78 | 30 | 14 | 44 | 504 | 24.144 |
-| popcount | 0 | 303 | 287 | 1782 | 24 | 1310 | 448 | 0 | 686 | 3136 | 31.268 |
-| popcount | 2 | 303 | 287 | 1782 | 24 | 1310 | 448 | 0 | 686 | 3136 | 35.833 |
-| is_solution | 0 | 209 | 200 | 16047 | 2428 | 7025 | 5184 | 1410 | 11202 | 66038 | 110.586 |
-| is_solution | 2 | 209 | 200 | 16047 | 2428 | 7025 | 5184 | 1410 | 11202 | 66038 | 111.035 |
+| add | 0 | 41 | 17 | 248 | 0 | 184 | 64 | 0 | 170 | 448 | 37.345 |
+| add | 2 | 41 | 17 | 128 | 0 | 100 | 28 | 0 | 79 | 196 | 29.665 |
+| multiply | 0 | 97 | 65 | 3664 | 0 | 592 | 2048 | 1024 | 3077 | 35840 | 46.485 |
+| multiply | 2 | 97 | 65 | 2478 | 0 | 446 | 1008 | 1024 | 2037 | 28560 | 74.348 |
+| compare | 0 | 49 | 25 | 214 | 92 | 78 | 30 | 14 | 44 | 504 | 28.868 |
+| compare | 2 | 49 | 25 | 127 | 60 | 37 | 16 | 14 | 25 | 406 | 27.274 |
+| popcount | 0 | 303 | 287 | 1782 | 24 | 1310 | 448 | 0 | 686 | 3136 | 32.664 |
+| popcount | 2 | 191 | 175 | 463 | 0 | 309 | 154 | 0 | 381 | 1078 | 85.685 |
+| is_solution | 0 | 209 | 200 | 16047 | 2428 | 7025 | 5184 | 1410 | 11202 | 66038 | 111.639 |
+| is_solution | 2 | 193 | 184 | 10668 | 1170 | 4240 | 3848 | 1410 | 7360 | 56686 | 477.794 |
 
 ## Reproduce
 

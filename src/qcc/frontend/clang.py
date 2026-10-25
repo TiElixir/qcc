@@ -31,6 +31,7 @@ _REQUIRED_FLAGS: tuple[str, ...] = (
     "-fno-vectorize",
     "-fno-slp-vectorize",
     "-funroll-loops",
+    "-fno-optimize-sibling-calls",
     "-gline-tables-only",
 )
 _OPTIONAL_PRESERVE_NAMES_FLAG = "-fno-discard-value-names"

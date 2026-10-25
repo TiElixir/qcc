@@ -221,8 +221,8 @@ def render_markdown(rows: Sequence[BenchmarkRow]) -> str:
         "",
         "Rows are emitted in the fixed order `add`, `multiply`, `compare`, "
         "`popcount`, `is_solution`, with optimizer levels 0 and 2 adjacent. "
-        "This v0.3 baseline has no integrated circuit optimizer, so identical "
-        "O0/O2 resource rows are valid and no reduction is claimed.",
+        "O0 is the v0.3 baseline; O2 enables the conservative v0.4 SSA, gate, "
+        "and clean-ancilla reuse passes. Reductions are measured, not inferred.",
         "",
         header,
         separator,

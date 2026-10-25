@@ -16,16 +16,14 @@ X/CX/CCX networks, and can emit OpenQASM 3. The project is designed to make
 its boundaries and resource costs explicit rather than to behave like a
 general-purpose C compiler.
 
-## Status: v0.4 contract specified; release pending
+## Status: v0.4 complete; release tag pending
 
-v0.3 is complete and tagged `v0.3.0`. This checkout records the v0.4
-optimization and release contract: optimizer levels O0/O1/O2, semantics-
-preserving SSA and peephole passes, lifetime-based eager cleanup and ancilla
-reuse proof obligations, conservative fallback, and labeled before/after
-resource reporting. The v0.4 optimizer implementation and benchmark evidence
-are not claimed here. No gate, depth, T-count, or qubit reduction is promised
-until it is shown by an emitted before/after report. The v0.3 lowering remains
-the compatibility baseline.
+v0.3 is complete and tagged `v0.3.0`. This checkout adds v0.4 optimizer levels
+O0/O1/O2, semantics-preserving SSA and peephole passes, lifetime-based eager
+cleanup, conservative clean-ancilla reuse, invariant tests, and measured
+benchmark rows in [docs/benchmarks.md](docs/benchmarks.md). O0 remains the
+compatibility baseline; O2 reductions are observed measurements, not promises
+about other source programs or hardware.
 
 The practical boundary remains a deliberately small pure-C subset: defined
 fixed-width integer values, arguments, arithmetic and predicates covered by
@@ -104,14 +102,9 @@ Toffoli count and estimated T count.
 
 `qcc stats` reports JSON fields such as `qubit_count`, `ancillas`, `depth`,
 `gate_count`, and `gate_counts` for `x`, `cx`, `ccx`, and any not-yet-expanded
-`mcx` operations. The Python report object provides the post-decomposition
-CCX count and derived T-count estimate. The JSON shown above is a v0.3
-baseline report; its `"optimizer": null` field does not represent a v0.4
-optimization result. A v0.4 report must retain the selected resource fields
-and add clearly labeled `before` and `after` snapshots, along with the
-requested/effective optimizer level and any conservative fallback. The two
-snapshots must be measured at the same primitive layer, so any reported delta
-is an observed result rather than a documentation estimate.
+`mcx` operations. The Python report object provides the selected optimizer
+level, post-decomposition CCX count, and derived T-count estimate. Compare O0
+and O2 rows in `docs/benchmarks.md` for measured before/after snapshots.
 
 ## Grover demo behavior
 

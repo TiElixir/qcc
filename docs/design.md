@@ -234,10 +234,9 @@ approximation. Every optimization must preserve the function's fixed-width
 mapping, named input/output layout, and clean-workspace invariant for every
 defined input.
 
-This section specifies what an eventual v0.4 implementation and release report
-must guarantee. It is not a performance result: an optimizer level may emit the
-same circuit as its fallback, and no reduction is claimed without measured
-before/after resource snapshots.
+This section specifies the integrated v0.4 implementation and release report.
+An optimizer level may emit the same circuit as its fallback; reductions are
+reported only when measured in the benchmark artifact.
 
 ### Optimization boundary and SSA passes
 

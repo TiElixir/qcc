@@ -153,9 +153,8 @@ LLVM IR is the validator's source of truth: qcc accepts a source program only
 when that shape is in the supported list, and it never skips an unrecognized
 instruction because the original C looked harmless. The v0.3 implementation
 and acceptance suite are integrated in this checkout. The v0.4 optimizer
-contract is specified above, but this documentation does not claim that its
-implementation or any resource reduction has shipped. Broader pointer/array
-support remains outside v0.4.
+implementation is integrated and its measured benchmark rows are recorded in
+`docs/benchmarks.md`. Broader pointer/array support remains outside v0.4.
 
 ## Diagnostic policy
 

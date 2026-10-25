@@ -523,19 +523,20 @@ def compile_c(
     """
 
     normalized_opt = normalize_level(opt)
-    enabled = optimizer_enabled(normalized_opt)
+    effective_opt = 0 if reuse_ancillas is False else normalized_opt
+    enabled = optimizer_enabled(effective_opt)
     if _looks_like_circuit(source_or_path):
         if enabled and isinstance(source_or_path, Circuit):
-            return optimize_circuit(source_or_path, normalized_opt)
+            return optimize_circuit(source_or_path, effective_opt)
         return source_or_path
     if _looks_like_ssa(source_or_path):
         selected_ssa = (
-            optimize_ssa(source_or_path, normalized_opt) if enabled else source_or_path
+            optimize_ssa(source_or_path, effective_opt) if enabled else source_or_path
         )
         lowered = lower_ssa(
             selected_ssa,
             function_name=function,
-            optimization_level=normalized_opt,
+            optimization_level=effective_opt,
             reuse_ancillas=reuse_ancillas,
         )
         circuit = _construct_circuit(lowered)
@@ -548,25 +549,25 @@ def compile_c(
     _, _, source_path = _source_and_path(source_or_path)
     source_name = str(source_path) if source_path is not None else "<stdin>"
     frontend_result = _materialize_frontend_result(
-        _invoke_frontend(frontend, source_or_path, function, normalized_opt),
+        _invoke_frontend(frontend, source_or_path, function, effective_opt),
         source_name=source_name,
     )
     selected = _select_function(frontend_result, function)
     if _looks_like_circuit(selected):
         if enabled and isinstance(selected, Circuit):
-            return optimize_circuit(selected, normalized_opt)
+            return optimize_circuit(selected, effective_opt)
         return selected
     if enabled:
-        selected = optimize_ssa(selected, normalized_opt)
+        selected = optimize_ssa(selected, effective_opt)
     lowered = lower_ssa(
         selected,
         function_name=function,
-        optimization_level=normalized_opt,
+        optimization_level=effective_opt,
         reuse_ancillas=reuse_ancillas,
     )
     circuit = _construct_circuit(lowered)
     if enabled and isinstance(circuit, Circuit):
-        return optimize_circuit(circuit, normalized_opt)
+        return optimize_circuit(circuit, effective_opt)
     return circuit
 
 

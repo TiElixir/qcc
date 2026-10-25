@@ -2,14 +2,6 @@
 
 from __future__ import annotations
 
-from qcc.opt import (
-    constant_fold,
-    dead_value_eliminate,
-    optimize_circuit,
-    optimize_gates,
-    optimize_ssa,
-)
-
 import qcc
 from qcc import Circuit, Gate
 from qcc.backend.report import resource_report
@@ -21,6 +13,13 @@ from qcc.ir.ssa import (
     IntType,
     Parameter,
     SSAValue,
+)
+from qcc.opt import (
+    constant_fold,
+    dead_value_eliminate,
+    optimize_circuit,
+    optimize_gates,
+    optimize_ssa,
 )
 from qcc.sim.classical import read_register, simulate
 
