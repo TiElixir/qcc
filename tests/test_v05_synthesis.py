@@ -21,9 +21,10 @@ from qcc.ir.ssa import (
     Parameter,
     SSAValue,
 )
+from qcc.sim.bitsliced import exhaustive_columns, simulate_columns
 from qcc.sim.classical import assign_inputs, read_register, simulate
 from qcc.synth import build_dag, synthesize_function
-from qcc.verify import assert_verified, verify
+from qcc.verify import assert_verified, evaluate_columns, verify
 from v02_helpers import build_native_library, native_function
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -315,3 +316,80 @@ def test_wide_arithmetic_is_sampled_and_still_verified() -> None:
     # Three 32-bit registers are unavoidable; the rest is the product and
     # transient carries, far below one register per SSA value and constant.
     assert circuit.num_qubits <= 6 * 32
+
+
+def _flips_output(circuit: Any, function: Function) -> bool:
+    """Whether the circuit maps output ``y`` to ``y ^ f(x)`` for a set ``y``."""
+
+    layout = circuit.layout
+    wires = [int(wire) for name in layout.inputs for wire in layout.inputs[name]]
+    outputs = [int(wire) for wire in layout.output]
+    for chunk in exhaustive_columns(len(wires)):
+        mask = (1 << chunk.count) - 1
+        columns = dict(zip(wires, chunk.columns, strict=True))
+        for wire in outputs:
+            columns[wire] = mask
+        final = simulate_columns(circuit, columns, chunk.count)
+        arguments = {}
+        offset = 0
+        for name in layout.inputs:
+            width = len(layout.inputs[name])
+            arguments[name] = chunk.columns[offset : offset + width]
+            offset += width
+        expected = evaluate_columns(function, arguments, chunk.count)
+        if any(
+            final[wire] != mask ^ column
+            for wire, column in zip(outputs, expected, strict=True)
+        ):
+            return False
+        if any(final[wire] != columns[wire] for wire in wires):
+            return False
+        if any(final[int(wire)] for wire in layout.ancillas):
+            return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        Case(EXAMPLES / "benchmarks.c", "is_solution"),
+        Case(EXAMPLES / "grover_oracle.c", "grover_oracle"),
+        Case(FIXTURES / "v03_grover.c", "is_solution"),
+    ),
+    ids=lambda case: case.identifier,
+)
+@pytest.mark.parametrize("opt", (0, 2, 3))
+def test_predicate_circuit_is_a_bit_flip_oracle(case: Case, opt: int) -> None:
+    """A one-bit result is XORed into the output qubit at every level.
+
+    Grover's phase kickback prepares the output qubit in a superposition, so
+    the circuit has to be correct when that qubit starts at one as well.
+    """
+
+    circuit = _circuit(case, opt)
+
+    assert _flips_output(circuit, _function(case))
+    if opt == 3:
+        output = int(circuit.layout.output[0])
+        assert all(output not in map(int, gate.controls) for gate in circuit.gates)
+
+
+def test_random_predicates_are_bit_flip_oracles_at_level_three() -> None:
+    checked = 0
+    for seed in range(400):
+        function = random_function(seed, branch_chance=0.25)
+        if function.return_type.width != 1:
+            continue
+        checked += 1
+        assert _flips_output(_direct(function, 3), function), f"seed {seed}"
+    assert checked > 30
+
+
+def test_wide_results_are_xored_only_below_level_three() -> None:
+    """Level 3 builds a wide result in place, so its register must start clear."""
+
+    case = Case(EXAMPLES / "benchmarks.c", "add")
+
+    assert _flips_output(_circuit(case, 0), _function(case))
+    assert _flips_output(_circuit(case, 2), _function(case))
+    assert not _flips_output(_circuit(case, 3), _function(case))
