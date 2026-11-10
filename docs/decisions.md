@@ -201,3 +201,67 @@ require an explicit reversible memory and aliasing model; global pebbling is a
 future space/time scheduling problem beyond local lifetime reuse; and ESOP
 synthesis is a future Boolean-network strategy. These are v0.5 limitations or
 stretch topics, not implicit v0.4 support.
+
+## D-018 — legalize calls, intrinsics, and variable shifts in the frontend
+
+**Status:** accepted for v0.5
+
+Current Clang emits `llvm.umin`, `llvm.fshl`, `llvm.abs`, and similar
+intrinsic calls for C that the v0.4 parser expected as `icmp`/`select`, so
+rejecting every `call` rejected programs inside the documented subset. qcc now
+parses calls and removes them before lowering: intrinsics expand to primitive
+operations, and calls to functions defined in the same file are inlined. No
+backend learns a new opcode, so both lowering paths and the verifier get the
+feature at once. Inlining is complete, not heuristic, because the subset has
+no recursion; a call-graph cycle is a diagnostic. External calls stay
+rejected because their bodies, and therefore their side effects, are unknown.
+
+## D-019 — reject per function, not per file
+
+**Status:** accepted for v0.5
+
+A module is validated function by function. A function that fails is stored
+with its diagnostic and raises it when requested; a function that calls it
+inherits that diagnostic. The alternative, rejecting the file, made a single
+`printf` helper block every unrelated function beside it. Strict whole-module
+parsing remains available as `parse_module(..., strict=True)`.
+
+## D-020 — make level 3 a separate synthesizer, not more passes on level 2
+
+**Status:** accepted for v0.5
+
+The level 0–2 lowering allocates a register per SSA value and a predicate per
+block. Its costs are structural: no peephole recovers the n-1 scratch wires
+of an out-of-place adder or the path-condition logic of a branch. Level 3
+therefore builds circuits from a dataflow graph with a different value
+representation (bit references) and in-place arithmetic. The older levels
+are kept unchanged as the stable baseline that reports compare against, and
+because they still accept the structural SSA dictionary input.
+
+If-conversion is the default treatment of branches at level 3. It evaluates
+both arms, which is free of semantic risk here (no traps, no side effects)
+and avoids synthesizing path predicates. It can cost more than predicated
+execution when one arm is very expensive and rarely taken; the benchmarks do
+not show that case, and it is noted as a known trade-off rather than solved.
+
+## D-021 — verify exhaustively, and say when the check was sampled
+
+**Status:** accepted for v0.5
+
+Correctness claims are backed by sweeping every input when the arguments
+total at most 20 bits. Bit-sliced simulation makes this cheap enough to run
+on every test and every fuzzed function. Above the limit the verifier
+samples with a fixed seed and its result is marked non-exhaustive, so a
+sampled pass is never presented as a proof. The verifier checks three
+properties, not one: output value, input preservation, and clean work wires.
+The last two are what make a circuit usable as a quantum oracle and are the
+ones a value-only test misses.
+
+## D-022 — keep the default optimization levels unchanged in v0.5
+
+**Status:** accepted for v0.5; expected to be revisited
+
+`compile_c` still defaults to `opt=1` and the CLI to `--opt O0`, so existing
+callers and recorded resource figures do not change underneath them. `qcc
+verify` defaults to O3 because it has no prior behavior to preserve. Making
+O3 the general default is a deliberate, separate change.

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "qcc"
-version = "0.4.1"
-description = "A deliberately bounded C-to-reversible-circuit compiler."
+version = "0.5.0"
+description = "A compiler from pure C functions to verified reversible quantum circuits."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -18,6 +18,8 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Compilers",
 ]
 dependencies = []
@@ -39,6 +41,7 @@ packages = ["src/qcc"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+  "/CHANGELOG.md",
   "/docs",
   "/LICENSE",
   "/README.md",

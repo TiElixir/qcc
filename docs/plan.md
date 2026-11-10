@@ -8,7 +8,8 @@ reversible X/CX/CCX circuits, emits OpenQASM 3, and reports resources. The
 baseline compiler uses out-of-place computation followed by Bennett
 compute-copy-uncompute so every temporary returns to its initial value. The
 v0.4 release contract adds semantics-preserving optimizer levels and measured
-before/after reporting without widening the source subset.
+before/after reporting without widening the source subset. v0.5 adds a
+whole-function synthesizer, an exhaustive verifier, and a wider frontend.
 
 ## Repository and toolchain
 
@@ -93,27 +94,50 @@ tests, and measured O0/O2 benchmark rows are integrated.
    artifact `docs/benchmarks.md` is owned by the benchmark work and is not
    created or edited by this documentation change.
 
-### v0.5 limitations and stretch
+### v0.5 — dataflow synthesis, verification, and a wider frontend
 
-These are deliberately deferred topics, not v0.4 support:
+**Status:** Implemented in the working tree; not yet tagged.
+
+1. Parse what current Clang emits for the existing subset: `or disjoint`,
+   `freeze`, and integer intrinsic calls. Accept calls to functions defined
+   in the same file by inlining them, and runtime shift amounts by expanding
+   them to barrel shifters. Validate per function so one rejected function
+   does not reject its file.
+2. Add optimizer level O3, which synthesizes a function from its hash-consed
+   dataflow graph: free wiring, if-conversion, in-place Cuccaro-style
+   arithmetic, and direct computation of the result into the output
+   register.
+3. Add `qcc verify` and `qcc.verify`: bit-sliced simulation against
+   independent reference evaluators, exhaustive up to 20 input bits and
+   sampled beyond, checking output, input preservation, and clean work
+   qubits.
+4. Add `scripts/fuzz.py`, which verifies random branching SSA functions
+   exhaustively, and keep a slice of it in the test suite.
+5. Regenerate `docs/benchmarks.md` with O0, O2, and O3 rows.
+
+Measured on `examples/benchmarks.c`, O3 reduces the T estimate between 4.5x
+and 28x and the qubit count between 1.6x and 6x relative to O0.
+
+### Limitations and candidates for later releases
 
 - **Arrays and pointers:** require a bounded reversible memory model, explicit
   alias analysis, and load/store cleanup rules before they can be accepted.
-- **Pebbling:** global space/time pebbling may improve on local lifetime reuse,
-  but needs a separate schedule and cost model.
-- **ESOP:** exclusive-sum-of-products synthesis is a possible Boolean-network
-  strategy for later lowering, not a current optimizer fallback.
-
-A v0.5 release may explore these areas only with new semantics, proof
-obligations, diagnostics, and measurements. The v0.4 scalar contract remains
-the compatibility boundary until then.
+- **`switch`:** rejected by the parser; lowering it to a branch chain would
+  let the existing if-conversion handle it.
+- **Range analysis:** O3 computes every value at its declared width. Tracking
+  known-zero high bits would shrink sums such as a population count.
+- **Pebbling:** O3 uncomputes all intermediates once, at the end. A
+  space/time pebbling schedule could release wide intermediates earlier.
+- **O1:** has a specified pass set but currently emits the O0 circuit.
+- **ESOP:** exclusive-sum-of-products synthesis is a possible strategy for
+  small Boolean-heavy functions.
 
 ## Commit and release rhythm
 
 Use small Conventional Commits. Land the bootstrap and each major subsystem
 independently, run the complete quality gate before each milestone tag, and
-create `v0.1.0`, `v0.2.0`, `v0.3.0`, and `v0.4.0` only after their acceptance
-criteria pass. The v0.4 tag additionally requires the optimizer verification
+create `v0.1.0`, `v0.2.0`, `v0.3.0`, `v0.4.0`, and `v0.5.0` only after their
+acceptance criteria pass. The v0.4 tag additionally requires the optimizer verification
 results and benchmark-owned before/after evidence; documentation alone does not
 constitute a reduction claim.
 

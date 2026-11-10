@@ -32,7 +32,19 @@ $ qcc stats examples/add.c --function add
 $ qcc check examples/add.c --function add
 ```
 
-The QASM file has named registers and starts in this form:
+These commands default to `--opt O0`, the stable baseline shown below. Add
+`--opt O3` for the synthesized circuit (25 qubits instead of 41 for `add`),
+and use `qcc verify` to check a circuit against the C function on every
+input:
+
+```console
+$ qcc verify examples/add.c --function add
+ok: add: verified on all 65536 inputs [O3: 25 qubits, 49 gates, T estimate 98]
+$ qcc verify examples/benchmarks.c --function multiply
+```
+
+At the default level the QASM file has named registers and starts in this
+form:
 
 ```qasm
 OPENQASM 3.0;
@@ -102,8 +114,8 @@ estimated T-count fields.
 The resource command prints JSON with fields including `qubit_count`,
 `ancillas`, `depth`, `gate_count`, and `gate_counts`. Exact counts are
 schedule-dependent. The Python report also exposes the post-MCX-decomposition
-CCX count and derived T-count estimate; v0.4 O0/O2 measurements are recorded in
-`docs/benchmarks.md`.
+CCX count and derived T-count estimate; O0, O2, and O3 measurements for
+`benchmarks.c` are recorded in `docs/benchmarks.md`.
 
 The required predicate can be requested with the same CLI shape:
 
@@ -143,6 +155,7 @@ and validation path do not require it.
 
 The examples are source inputs, not standalone executables; qcc invokes Clang
 and compiles the selected function. Use `--dump-ir` to inspect the textual
-LLVM IR received by the lowering pipeline. Unsupported C, runtime divisors,
-signed division/remainder, pointers, memory, floating point, I/O, and
-undefined behavior remain outside the documented subset.
+LLVM IR Clang produced. Helper functions defined in the same file are inlined,
+so an example may be split across several functions. Recursion, external
+calls, runtime divisors, signed division/remainder, pointers, memory, floating
+point, I/O, and undefined behavior remain outside the documented subset.

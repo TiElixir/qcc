@@ -1,13 +1,14 @@
 # Supported C subset
 
-This document is the authoritative source-level contract for qcc v0.4. It
+This document is the authoritative source-level contract for qcc v0.5. It
 covers the constructs that may be lowered after Clang emits normalized textual
-LLVM IR. v0.4 retains the v0.3 source subset and adds optimization semantics; it
-does not make arrays, pointers, or other previously rejected constructs
+LLVM IR. v0.5 widens the v0.4 subset with calls to functions defined in the
+same file, the integer intrinsics Clang emits for ordinary C, and shifts by a
+runtime amount. It does not make arrays, pointers, or other memory constructs
 supported. A construct is supported only when its generated IR satisfies the
 value, CFG, arithmetic, cleanup, and optimizer rules below.
 
-## Supported in v0.4
+## Supported in v0.5
 
 ### Function and value model
 
@@ -18,14 +19,14 @@ value, CFG, arithmetic, cleanup, and optimizer rules below.
   interpret their operands as two's-complement bit patterns. General signed
   arithmetic that can overflow is not made defined by qcc.
 - No observable side effects: the function may not read or write global state,
-  perform I/O, access memory, or call another function.
+  perform I/O, access memory, or call a function that is not defined in the
+  same file.
 - Defined source behavior only. C undefined behavior, poison, and `undef`
   values are rejected rather than assigned reversible semantics.
 
 ### Integer expressions
 
-The v0.3 lowering contract covers these operations when widths and operands are
-valid:
+These operations are covered when widths and operands are valid:
 
 - Integer constants and function arguments.
 - Addition and subtraction (`+`, `-`) with the documented fixed-width modulo
@@ -42,18 +43,49 @@ valid:
   `sge`, `slt`, and `sle`.
 - Conditional expressions and LLVM `select` when the condition is `i1` and
   both arms have the same integer type.
-- Constant-count shifts. Unsigned left/right shifts are supported when the
-  count is a compile-time value in `0 <= count < width`. A signed right shift
-  is accepted only when the frontend supplies the documented two's-complement
+- Shifts. A compile-time count must satisfy `0 <= count < width` and is pure
+  wiring. A runtime count becomes a barrel shifter with one mux stage per
+  count bit. C leaves a shift by the operand width or more undefined, so only
+  the count bits that can select a defined shift are examined; the circuit's
+  value for an out-of-range count is unspecified. A signed right shift is
+  accepted only when the frontend supplies the documented two's-complement
   `ashr` semantics.
-- Constant-count rotates represented by a recognized fixed-width rotate idiom
-  or frontend operation. The count is reduced modulo the operand width; a
-  variable rotate is not supported.
+- Rotates, as a recognized fixed-width idiom or the `llvm.fshl`/`llvm.fshr`
+  funnel shifts. The count is reduced modulo the operand width. A runtime
+  count requires a power-of-two width.
 - Unsigned division and remainder by a compile-time nonzero constant. The
   normalized operations are `udiv` and `urem`, the divisor is represented at
   the operation width, and the restoring schedule computes `floor(x / d)` or
   `x % d` for `1 <= d < 2**width`.
 - Returning a supported integer value.
+
+### Function calls
+
+- A direct call to a function defined in the same translation unit. Every
+  call is inlined, so the compiled circuit is always one self-contained
+  function; a callee with branches or early returns is spliced into the
+  caller's CFG. `static`, `inline`, and `noinline` helpers are all accepted.
+- A file is validated function by function. A function that uses an
+  unsupported construct is rejected with its own diagnostic, as is every
+  function that calls it; the remaining functions in the file still compile.
+
+### Integer intrinsics
+
+Clang rewrites common C idioms and builtins into LLVM intrinsics. qcc expands
+these into the primitive operations above:
+
+| Intrinsic | Typical C source |
+| --- | --- |
+| `llvm.umin`, `llvm.umax`, `llvm.smin`, `llvm.smax` | `a < b ? a : b` and friends |
+| `llvm.abs` | `a < 0 ? -a : a` |
+| `llvm.ctpop` | `__builtin_popcount` |
+| `llvm.ctlz`, `llvm.cttz` | `__builtin_clz`, `__builtin_ctz` |
+| `llvm.bswap`, `llvm.bitreverse` | `__builtin_bswap16/32/64`, bit reversal |
+| `llvm.fshl`, `llvm.fshr` | rotate idioms |
+| `llvm.uadd.sat`, `llvm.usub.sat` | saturating add/subtract idioms |
+
+Value-free intrinsics (`llvm.lifetime.*`, `llvm.dbg.*`, `llvm.assume`) are
+ignored. Any other intrinsic is rejected by name.
 
 ### Control flow and SSA
 
@@ -69,7 +101,7 @@ valid:
 - A source conditional expression may lower to `select` instead of a branch;
   both forms use the same reversible predicate and mux semantics.
 
-## v0.4 optimizer semantics
+## Optimizer semantics
 
 Optimization is a semantics-preserving schedule choice after source validation.
 It does not change the C-to-LLVM acceptance boundary or give a rejected
@@ -81,17 +113,25 @@ The release contract defines these levels:
 
 - **O0** keeps the deterministic v0.3 Bennett compute-copy-uncompute baseline
   and does not apply optional SSA, gate, eager-uncomputation, or reuse passes.
-- **O1** may constant-fold defined fixed-width SSA expressions, propagate
-  copies and identities, eliminate dead values, simplify known predicates/
-  muxes, and apply local reversible-gate cancellations or proven commuting
-  rewrites. It does not require lifetime-based ancilla reuse.
-- **O2** includes O1 and may eagerly uncompute a temporary at its last
+- **O1** is permitted to constant-fold defined fixed-width SSA expressions,
+  propagate copies and identities, eliminate dead values, and apply local
+  reversible-gate cancellations. The current implementation applies none of
+  these at O1 and emits the O0 circuit.
+- **O2** may additionally uncompute a temporary eagerly at its last
   path-aware use, then reuse its clean workspace only when the lifetime and
   cleanup proof obligations in [design.md](design.md) are discharged.
+- **O3** synthesizes the whole function from its dataflow graph instead of
+  lowering instruction by instruction: wiring-only operations emit no gates,
+  branches are if-converted to selects, arithmetic is computed in place, and
+  the returned value is produced directly in the output register. See
+  [design.md](design.md#v05-dataflow-synthesis).
 
-The level is an allowed pass set, not a performance promise. O2 may produce the
-same circuit as O1 or O0. Levels above O2 have no v0.4 meaning and must not be
-silently aliased to O2.
+The level selects a strategy, not a performance promise. O2 may produce the
+same circuit as O0. Levels above O3 have no meaning and are rejected rather
+than silently aliased to O3. O3 needs a typed function parsed from C; the
+structural SSA dictionary accepted by `compile_c` for compatibility is
+compiled at O2, and the resource report records 3 as the requested level and
+2 as the effective one.
 
 ### Conservative optimizer fallback
 
@@ -105,31 +145,45 @@ the last verified schedule. O2 therefore falls back to a verified O1 or O0
 schedule rather than emitting an approximate circuit or reusing an uncertain
 wire.
 
-A v0.4 resource report records both the requested and effective level and a
+A resource report records both the requested and effective level and a
 machine-readable fallback reason when applicable. It also records before/after
-snapshots from the same post-decomposition primitive layer. A fallback is not a
-resource reduction claim; the report must make clear which schedule actually
-ran.
+snapshots from the same post-decomposition primitive layer; at O3 the `before`
+snapshot is the O0 circuit for the same function. A fallback is not a resource
+reduction claim; the report must make clear which schedule actually ran.
 
-## Unsupported in v0.4
+## Verification
 
-The following constructs are outside the authoritative v0.4 contract and must
-be rejected:
+The contract above is checkable. `qcc verify` and `qcc.verify.verify` compare
+a compiled circuit with a reference evaluation of the parsed function. For
+each input they check the output register, that every input register is
+unchanged, and that every work qubit returned to zero. All inputs are tried
+when the arguments total at most 20 bits; beyond that a seeded random sample
+is used and the result says so. A sampled pass is evidence, not proof.
+
+The reference evaluates the same parsed LLVM function the circuit was built
+from, so it checks lowering and synthesis, not Clang or the LLVM parser. The
+test suite covers that remaining gap separately by comparing parsed functions
+and circuits against natively compiled C.
+
+## Unsupported in v0.5
+
+The following constructs are outside the authoritative contract and must be
+rejected:
 
 - Runtime, data-dependent, or partially unrolled loops; any CFG cycle,
   backedge, self-loop, or residual strongly connected component.
 - `switch`, indirect branches, computed `goto`, exception edges, and other
   terminators that are not normalized to the supported branch CFG.
-- Variable shifts and rotates, shift counts outside the operand width, and
-  source signed-right-shift forms whose result depends on implementation-
-  defined C behavior.
+- Constant shift counts outside the operand width, runtime rotates of a
+  width that is not a power of two, and source signed-right-shift forms whose
+  result depends on implementation-defined C behavior.
 - Runtime/general division and remainder, including `x / y` or `x % y` when
   the divisor is not a compile-time constant. qcc does not lower a
   data-dependent divisor.
 - Signed division and signed remainder (`sdiv`, `srem`, or signed C `/` and
   `%`) even when the divisor is a constant. Signed quotient/remainder sign
   restoration and the C `INT_MIN / -1` overflow case are outside this
-  v0.4 contract.
+  contract.
 - Zero-divisor division or remainder, even if written as a constant. C makes
   this operation undefined, so qcc rejects it rather than choosing quotient or
   remainder bits.
@@ -137,7 +191,8 @@ be rejected:
   change the fixed-width contract.
 - Pointers, arrays, structs, unions, `volatile` access, loads, stores, address
   calculations, dynamic allocation, and global state.
-- Function calls, recursion, function pointers, inline assembly, I/O, and
+- Recursion (direct or mutual), calls to functions not defined in the same
+  file, function pointers and other indirect calls, inline assembly, I/O, and
   other observable side effects.
 - Signed arithmetic whose C result can depend on overflow. Signed comparisons
   are supported as specified above; that exception does not make signed
@@ -151,10 +206,9 @@ be rejected:
 Clang may lower a source construct into a different LLVM shape. The normalized
 LLVM IR is the validator's source of truth: qcc accepts a source program only
 when that shape is in the supported list, and it never skips an unrecognized
-instruction because the original C looked harmless. The v0.3 implementation
-and acceptance suite are integrated in this checkout. The v0.4 optimizer
-implementation is integrated and its measured benchmark rows are recorded in
-`docs/benchmarks.md`. Broader pointer/array support remains outside v0.4.
+instruction because the original C looked harmless. Measured benchmark rows
+for every optimizer level are recorded in `docs/benchmarks.md`. Pointer and
+array support remains outside v0.5.
 
 ## Diagnostic policy
 
@@ -166,7 +220,9 @@ circuit. Diagnostics follow these rules:
    that established the error.
 2. Name the rejected source or LLVM construct and state the violated rule. For
    example, a residual backedge must say that full constant-bound unrolling is
-   required; a variable shift must say that only constant wiring is supported.
+   required; an external call must name the callee and say that only functions
+   defined in the same file can be inlined; a pointer parameter is reported at
+   the first instruction that dereferences it.
 3. Validate at each boundary. Clang failures, malformed textual LLVM, invalid
    types, unsupported opcodes, malformed phi edge sets, and residual CFG cycles
    must not be silently normalized into a different program.

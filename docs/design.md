@@ -12,10 +12,11 @@ The intended pipeline is:
 ```text
 C source
   -> Clang textual LLVM IR
-  -> normalized and validated qcc IR
-  -> reversible lowering and ancilla scheduling
+  -> normalized and validated qcc IR (calls inlined, intrinsics expanded)
+  -> reversible lowering and ancilla scheduling (O0-O2)
+     or whole-function dataflow synthesis (O3)
   -> X/CX/CCX circuit
-  -> simulation, resource report, or OpenQASM 3
+  -> simulation, verification, resource report, or OpenQASM 3
 ```
 
 Each arrow is a validation boundary. Unsupported syntax, types, opcodes, and
@@ -26,7 +27,9 @@ specify arithmetic growth, MCX lowering, named QASM registers, and resource
  conventions. The v0.3 arithmetic, QASM, and resource implementations are
 integrated and covered by the release test suite. The v0.4 section specifies
 semantics-preserving optimization and release reporting; it is a contract, not
-a claim that a resource reduction has already been measured.
+a claim that a resource reduction has already been measured. The v0.5 sections
+describe frontend legalization, the level-3 synthesizer, and the verifier that
+checks every level against the source function.
 
 ## Frontend boundary
 
@@ -343,9 +346,11 @@ set; it is not a promise that a higher level will reduce any resource.
 | `O2` | `O1` plus lifetime-based eager uncomputation and clean-ancilla reuse when every proof obligation is discharged | Each failed proof falls back to the last verified `O1`/`O0` schedule and is reported |
 
 The allowed pass set is monotonic, but resource counts need not improve at every
-level. O2 is allowed to equal O1 or O0. Levels above O2 have no v0.4 semantics
-and must not be silently treated as an alias for O2 by a release
-implementation.
+level. O2 is allowed to equal O1 or O0. The implementation uses that freedom:
+it applies no optional pass at `O1`, whose circuit is the `O0` circuit, and
+runs SSA simplification, gate cancellation, eager uncomputation, and reuse
+together at `O2`. v0.5 adds `O3`, specified below; levels above it are
+rejected rather than aliased.
 
 ### Before/after resource reporting
 
@@ -375,6 +380,155 @@ remain the selected (`after`) view for compatibility. At `O0`, the before and
 after snapshots are intentionally the same baseline. A release note may claim a
 reduction only when the corresponding before/after values were actually
 measured and verified.
+
+## v0.5 frontend legalization
+
+The LLVM parser accepts three things that no lowering stage implements
+directly: calls to functions defined in the same module, the integer
+intrinsics Clang emits for ordinary C, and shifts by a runtime amount.
+`qcc.frontend.legalize` rewrites all three into the primitive operations of
+the earlier sections, so every consumer after the frontend sees one
+self-contained function.
+
+- **Calls are inlined.** This is always possible because the subset has no
+  recursion and no side effects. A single-block callee is spliced in place. A
+  multi-block callee is cloned with fresh value and block names; the caller's
+  block is split at the call, each cloned `ret` branches to the continuation,
+  and a `phi` there selects the returned value. Callees are legalized first,
+  bottom-up over the call graph; a cycle in that graph is reported as
+  recursion with the full call chain.
+- **Intrinsics are expanded** into `icmp`/`select`/shift/arithmetic
+  sequences: min/max and `abs` become a comparison and a select, `ctpop`
+  becomes a sum of the individual bits, `ctlz`/`cttz` become a priority chain
+  of selects, `bswap`/`bitreverse` become shifts and masks that later reduce
+  to wiring, and the saturating forms become an add or subtract with an
+  overflow comparison.
+- **Variable shifts become barrel shifters**: stage `k` selects between the
+  value and the value shifted by the constant `2**k` under bit `k` of the
+  amount. Only `ceil(log2(width))` amount bits are examined, because a shift
+  by the width or more is undefined in C.
+
+Validation is per function. In the default non-strict mode used by
+`compile_c`, a function that fails validation is recorded with its diagnostic
+in `Module.rejected`, and so is any function that calls it; asking for a
+rejected function raises the stored diagnostic, and the other functions in
+the file compile normally. A pointer parameter is not rejected at the
+signature, where the message would be vague; it is rejected at its first
+dereference, which has a source line.
+
+## v0.5 dataflow synthesis
+
+Levels 0 through 2 lower one SSA instruction at a time: each value gets a
+register, each block gets a path predicate, and Bennett's
+compute-copy-uncompute wraps the whole function. Level 3 instead treats the
+function as what the subset guarantees it is: a pure expression of its
+arguments.
+
+### The expression graph
+
+`qcc.synth.dag` converts the function to a hash-consed graph in which every
+value is a node and structurally equal computations share one node.
+Construction normalizes as it goes: constants fold, algebraic identities
+collapse, commutative operands are ordered, and the ten `icmp` predicates
+reduce to `eq` and unsigned `ult` plus bit inversions (a signed comparison is
+an unsigned comparison with both sign bits flipped).
+
+Control flow disappears by if-conversion. A `phi` becomes a tree of `select`
+nodes that mirrors the branches between the phi's dominator and its block:
+for a conditional branch whose arms reach the merge with different values,
+the node is `select(condition, value_if_true, value_if_false)`, built
+recursively. Each branch condition is therefore used exactly where the source
+tested it, and no conjunction of path conditions is ever synthesized. The
+function's return value is the same construction applied to a virtual exit
+block that merges every `ret`. This is sound because the subset has no side
+effects and no traps: evaluating both arms of a branch and selecting is
+indistinguishable from evaluating one.
+
+### Bit references and free operations
+
+`qcc.synth.lower` represents a value as a list of bit references. A reference
+is the constant 0, the constant 1, or a wire with an optional inversion flag.
+Operations that only rearrange, duplicate, discard, or negate bits therefore
+cost nothing: constants, shifts and rotates by constants, `zext`, `sext`,
+`trunc`, masks with constants, bitwise NOT, and byte swaps emit no gate and
+allocate no qubit. Gates appear only where two unknown bits interact, and a
+gate whose control is a constant or an inverted wire is resolved when it is
+emitted (dropped, demoted from `CCX` to `CX`, or conjugated with `X`).
+
+### Arithmetic blocks
+
+Every arithmetic block leaves behind exactly its result and returns its
+scratch wires, at zero, to a free pool.
+
+- **Addition** is an in-place ripple adder, `target += addend`. Carries are
+  computed bottom-up and the sum is written top-down, each carry being
+  uncomputed just before the target bit it came from is overwritten. Where
+  an addend wire is used nowhere else in the block, the carry is stored in
+  that wire (Cuccaro's arrangement) and the wire is restored on the way
+  back, so an n-bit addition of two registers needs one scratch wire instead
+  of n. Constant and inverted addend bits simplify the majority gate
+  instead. Subtraction is addition of the inverted addend with carry-in one.
+- **Comparison** `a < b` is the carry out of `~a + b`, computed with the same
+  carry chain and no sum. Equality is a multi-controlled toggle over the
+  bitwise XNOR.
+- **Selection** `c ? a : b` is `b ^ c(a ^ b)` per bit, one Toffoli, with the
+  constant and equal-arm cases reduced to wiring or a single `CX`.
+- **Multiplication** is shift-and-add: for each multiplier bit, a controlled
+  in-place addition of the shifted multiplicand into the product, truncated
+  to the result width. A constant multiplier bit makes its row
+  unconditional or absent.
+- **Constant division** is in-place restoring division. The quotient and
+  remainder of one dividend share a single computation, so `x / d` and
+  `x % d` together cost one divider.
+
+### Output and cleanup
+
+The graph is lowered in dependency order, computing each intermediate node
+into wires from the pool. The root is treated differently: its final
+operation writes straight into the output register (through `zext` and
+similar wiring when present), and those gates are never undone. The recorded
+gates for the intermediates are then replayed in reverse, which returns
+every work wire to zero because each gate is self-inverse. Only the
+intermediates pay Bennett's factor of two; a function that is a single
+addition is a single adder.
+
+Inputs are never modified except transiently inside a block that restores
+them, which is what lets the Cuccaro adder borrow them.
+
+### What level 3 does not do
+
+It performs no range analysis (a population count is summed at full width),
+no pebbling beyond the block-local scratch pool, and no relative-phase or
+measurement-based Toffoli tricks: the output is plain `X`/`CX`/`CCX`, and the
+T estimate uses the same seven-per-`CCX` convention as every other level.
+The synthesizer needs typed SSA from the C frontend; the structural
+dictionary form accepted for compatibility is compiled at level 2 and
+reported as such.
+
+## v0.5 verification
+
+`qcc.verify` checks a circuit against the function it was compiled from. It
+contains two reference evaluators written independently of both lowering
+paths: a scalar CFG interpreter (`evaluate`) and a bit-sliced one
+(`evaluate_columns`) in which each Python integer holds one bit position of a
+value across many inputs. `qcc.sim.bitsliced` simulates the circuit in the
+same representation, so a gate is one or two big-integer operations
+regardless of how many inputs are being swept.
+
+For each input, `verify` checks that the output register equals the reference
+value, that every input register is unchanged, and that every wire outside
+the inputs and output is zero. Up to 20 input bits the sweep is exhaustive;
+above that, inputs are drawn from a seeded generator and the result records
+that it was sampled. A failure carries the first offending input, the kind
+of violation, and the expected and actual values.
+
+The verifier trusts the parsed SSA function, so it covers lowering,
+synthesis, and gate optimization but not Clang or the LLVM parser. Those are
+covered by tests that compare both the parsed function and the circuit with
+natively compiled C. `scripts/fuzz.py` closes the remaining gap on the
+backend side: it generates random well-typed SSA functions with nested
+branches, early returns, and phis, and requires exhaustive verification of
+each.
 
 ## Loop-unroll policy
 
