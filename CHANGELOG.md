@@ -37,6 +37,24 @@ change behavior.
 - `scripts/fuzz.py`: a differential fuzzer that exhaustively verifies random
   SSA functions with nested branches and early returns.
 - `--opt O3` on every CLI command; `MAX_LEVEL` is now 3.
+- **`switch`**. The parser rewrites an LLVM `switch` into a chain of `icmp eq`
+  tests and two-way branches before the CFG is validated, so every later
+  stage sees only `br` and `ret`. Clang also emits a `switch` for any run of
+  `==` tests on one value, so an `if (a == 0) ... else if (a == 1) ...`
+  chain, or the same written with `?:`, was previously rejected with
+  "unsupported LLVM instruction 'switch'" and now compiles. A function that
+  can still reach an LLVM `unreachable` instruction is rejected.
+- The output-register contract is stated and tested. At every level the
+  result is computed into an output register that starts at zero, the inputs
+  are preserved, and work qubits return to zero. At O0, O1, and O2 the
+  result is also XORed into the output register for any starting value. At
+  O3 that holds for a one-bit result, whose output qubit is only ever a gate
+  target, which is what Grover-style phase kickback needs; a wider O3 result
+  is built in place, so its output register must start at zero.
+- New top-level documents: `USAGE.md` (installation, commands, the Python
+  interface, troubleshooting) and `DOCUMENTATION.md` (circuit rules, accepted
+  C, levels, limits). Both, and the rewritten `README.md`, use ASD-STE100
+  Simplified Technical English. The sdist includes the two new files.
 
 ### Changed
 
@@ -49,6 +67,8 @@ change behavior.
 - `scripts/benchmarks.py` measures O0, O2, and O3 and adds a summary table.
 - When `opt=3` is requested for structural SSA input, the circuit is built
   at level 2 and the report shows requested 3, effective 2.
+- Parser messages no longer carry stale release tags such as "is not
+  supported in v0.1" or "in the integer v0.2 frontend".
 
 ### Fixed
 
@@ -58,10 +78,21 @@ change behavior.
 - Comparing a value with itself (`icmp` with identical operands) raised
   `GateError: ccx cannot reuse a qubit` in the O0–O2 lowering.
 
+- Diagnostic source locations. An instruction with no debug location of its
+  own was reported at its line in the generated LLVM text, labelled with the
+  C file name, so a 24-line C file could get an error "at line 146". It now
+  falls back to the source line of its enclosing function.
+- A rejected global variable was reported at a blank line or at an unrelated
+  assignment. The diagnostic now names the variable (`global variable
+  @name: global mutable state, global variables, and global initializers are
+  not supported`) and points at its declaration in the C file. When the C
+  source cannot be read back, as when it is passed as a string, it gives the
+  file name with no line rather than a wrong one.
+
 ### Known limitations
 
 - O1 emits the same circuit as O0.
-- `switch`, recursion, external calls, pointers, arrays, runtime divisors,
+- Recursion, external calls, pointers, arrays, runtime divisors,
   and signed division remain unsupported.
 
 ## 0.4.0

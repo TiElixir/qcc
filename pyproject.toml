@@ -43,8 +43,10 @@ packages = ["src/qcc"]
 include = [
   "/CHANGELOG.md",
   "/docs",
+  "/DOCUMENTATION.md",
   "/LICENSE",
   "/README.md",
+  "/USAGE.md",
   "/pyproject.toml",
   "/src",
 ]

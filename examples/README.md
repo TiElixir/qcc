@@ -32,7 +32,8 @@ $ qcc stats examples/add.c --function add
 $ qcc check examples/add.c --function add
 ```
 
-These commands default to `--opt O0`, the stable baseline shown below. Add
+[USAGE.md](../USAGE.md) lists every command and option. These commands
+default to `--opt O0`, the stable baseline shown below. Add
 `--opt O3` for the synthesized circuit (25 qubits instead of 41 for `add`),
 and use `qcc verify` to check a circuit against the C function on every
 input:
@@ -156,6 +157,8 @@ and validation path do not require it.
 The examples are source inputs, not standalone executables; qcc invokes Clang
 and compiles the selected function. Use `--dump-ir` to inspect the textual
 LLVM IR Clang produced. Helper functions defined in the same file are inlined,
-so an example may be split across several functions. Recursion, external
+so an example may be split across several functions. A `switch`, or a chain
+of `if (a == k)` tests on one value, is accepted; Clang emits both as an LLVM
+`switch`, which qcc lowers to a branch chain. Recursion, external
 calls, runtime divisors, signed division/remainder, pointers, memory, floating
 point, I/O, and undefined behavior remain outside the documented subset.

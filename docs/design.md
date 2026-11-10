@@ -383,12 +383,13 @@ measured and verified.
 
 ## v0.5 frontend legalization
 
-The LLVM parser accepts three things that no lowering stage implements
+The LLVM parser accepts four things that no lowering stage implements
 directly: calls to functions defined in the same module, the integer
-intrinsics Clang emits for ordinary C, and shifts by a runtime amount.
-`qcc.frontend.legalize` rewrites all three into the primitive operations of
-the earlier sections, so every consumer after the frontend sees one
-self-contained function.
+intrinsics Clang emits for ordinary C, shifts by a runtime amount, and
+`switch`. `qcc.frontend.legalize` rewrites the first three into the primitive
+operations of the earlier sections; the parser itself rewrites `switch` (see
+the last bullet), so every consumer after the frontend sees one
+self-contained function made of `br` and `ret` control flow.
 
 - **Calls are inlined.** This is always possible because the subset has no
   recursion and no side effects. A single-block callee is spliced in place. A
@@ -407,6 +408,22 @@ self-contained function.
   value and the value shifted by the constant `2**k` under bit `k` of the
   amount. Only `ceil(log2(width))` amount bits are examined, because a shift
   by the width or more is undefined in C.
+- **`switch` becomes a branch chain, in the parser.** This happens in
+  `_parse_switch`, `_lower_switches`, and `_finish_blocks` of
+  `qcc.frontend.llvm_parser`, not in `qcc.frontend.legalize`, and it runs
+  before the CFG is validated. Clang emits a `switch` for a C `switch`
+  statement and for any run of `==` tests on one value, so an `if`/`else if`
+  chain or a `?:` chain reaches the parser as one. The switch block becomes
+  a chain: for each distinct case target, an `icmp eq` of the selector with
+  each of that target's case values, ORed together, and a two-way branch to
+  the target or to the next test. The last branch falls through to the
+  default label. A phi in a target block named the switch block as its
+  predecessor, so its edges are renamed to the chain block that now
+  branches there. When the cases cover every value of the selector, Clang
+  points the default label at an `unreachable` block; the last case target
+  then becomes the fall-through and the dead block is dropped. An
+  `unreachable` that a branch can still reach is rejected as code with
+  undefined behavior.
 
 Validation is per function. In the default non-strict mode used by
 `compile_c`, a function that fails validation is recorded with its diagnostic
@@ -494,6 +511,15 @@ addition is a single adder.
 
 Inputs are never modified except transiently inside a block that restores
 them, which is what lets the Cuccaro adder borrow them.
+
+For a one-bit result the output qubit is only ever a gate target, never a
+control, so the circuit XORs the result into whatever the qubit held. This
+is the bit-flip oracle that phase kickback requires, and a test checks that
+no gate is controlled by the output qubit. For a wider result the root is
+built in place in the output register, whose wires then act as controls of
+the arithmetic, so the register has to start at zero. Levels 0 through 2 XOR
+the result for any starting value at every width. All four levels preserve
+the inputs and return work qubits to zero.
 
 ### What level 3 does not do
 

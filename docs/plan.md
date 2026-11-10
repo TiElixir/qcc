@@ -114,6 +114,14 @@ tests, and measured O0/O2 benchmark rows are integrated.
 4. Add `scripts/fuzz.py`, which verifies random branching SSA functions
    exhaustively, and keep a slice of it in the test suite.
 5. Regenerate `docs/benchmarks.md` with O0, O2, and O3 rows.
+6. Accept `switch`, which the parser lowers to a chain of `icmp eq` tests and
+   two-way branches before CFG validation. This also accepts the `if`/`else
+   if` and `?:` chains on one value that Clang emits as a `switch`.
+7. State and test the output-register contract: every level starts the output
+   at zero, preserves inputs, and cleans work qubits; O0 to O2, and O3 for a
+   one-bit result, also XOR into the output.
+8. Report diagnostic locations in the C source, and add `USAGE.md` and
+   `DOCUMENTATION.md`.
 
 Measured on `examples/benchmarks.c`, O3 reduces the T estimate between 4.5x
 and 28x and the qubit count between 1.6x and 6x relative to O0.
@@ -122,8 +130,6 @@ and 28x and the qubit count between 1.6x and 6x relative to O0.
 
 - **Arrays and pointers:** require a bounded reversible memory model, explicit
   alias analysis, and load/store cleanup rules before they can be accepted.
-- **`switch`:** rejected by the parser; lowering it to a branch chain would
-  let the existing if-conversion handle it.
 - **Range analysis:** O3 computes every value at its declared width. Tracking
   known-zero high bits would shrink sums such as a population count.
 - **Pebbling:** O3 uncomputes all intermediates once, at the end. A

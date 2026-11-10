@@ -265,3 +265,19 @@ ones a value-only test misses.
 callers and recorded resource figures do not change underneath them. `qcc
 verify` defaults to O3 because it has no prior behavior to preserve. Making
 O3 the general default is a deliberate, separate change.
+
+## D-023 — lower `switch` in the parser, before CFG validation
+
+**Status:** accepted for v0.5
+
+Clang emits a `switch` for a C `switch` statement and for any run of `==`
+tests on one value, so an ordinary `if`/`else if` or `?:` chain was rejected
+with "unsupported LLVM instruction 'switch'". qcc now rewrites it, inside the
+parser, into a chain of `icmp eq` tests and two-way branches. The rewrite
+precedes CFG validation because the validator rejects a phi that lists one
+predecessor twice, and a switch legitimately produces that: LLVM prints one
+phi entry per switch edge. Lowering first means the validator, both circuit
+backends, the legalizer, and the reference evaluators only ever see `br` and
+`ret`, and none of them learns a new terminator. An `unreachable` that a
+branch can still reach is rejected as undefined behavior; one that only
+served as the default of a switch covering every selector value is dropped.

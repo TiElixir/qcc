@@ -92,6 +92,19 @@ ignored. Any other intrinsic is rejected by name.
 - A single entry block and a finite, reachable CFG made from unconditional and
   conditional branches and integer returns. Nested `if`/`else` regions are
   supported after normalization.
+- `switch`. The parser rewrites it, before CFG validation, into a chain of
+  `icmp eq` tests and two-way branches: one test per distinct case target
+  (the OR of that target's case values), the last branch falling through to
+  the default label. Clang emits a `switch` for a C `switch` statement and
+  also for any run of `==` tests on one value, so an `if (a == 0) ... else if
+  (a == 1) ... else if (a == 5) ...` chain, or the same written with `?:`,
+  depends on this rule. When the cases cover every value of the selector,
+  Clang points the default label at an `unreachable` block and the last case
+  target takes its place as the fall-through. An `unreachable` that a branch
+  can still reach, such as a `__builtin_unreachable()` that Clang cannot
+  remove, is rejected: this function can reach code that has undefined
+  behavior, and only functions that are defined for every input are
+  supported.
 - `phi` nodes at the beginning of a merge block. Each reachable predecessor
   edge has exactly one same-width incoming value, and the incoming value is
   selected by the edge that actually reached the block.
@@ -125,6 +138,15 @@ The release contract defines these levels:
   branches are if-converted to selects, arithmetic is computed in place, and
   the returned value is produced directly in the output register. See
   [design.md](design.md#v05-dataflow-synthesis).
+
+Every level computes the result into an output register that starts at zero,
+preserves the input registers, and returns work qubits to zero. O0, O1, and
+O2 additionally XOR the result into the output register, so the circuit is
+correct for any starting value of that register. O3 does the same for a
+one-bit result, because its output qubit is only ever a gate target and never
+a control; this is the bit-flip oracle form that Grover-style phase kickback
+needs. For a wider result O3 builds the value in place in the output
+register, so that register must start at zero.
 
 The level selects a strategy, not a performance promise. O2 may produce the
 same circuit as O0. Levels above O3 have no meaning and are rejected rather
@@ -172,8 +194,9 @@ rejected:
 
 - Runtime, data-dependent, or partially unrolled loops; any CFG cycle,
   backedge, self-loop, or residual strongly connected component.
-- `switch`, indirect branches, computed `goto`, exception edges, and other
-  terminators that are not normalized to the supported branch CFG.
+- Indirect branches, computed `goto`, exception edges, and other terminators
+  that are not normalized to the supported branch CFG. A `switch` is
+  normalized; an `unreachable` that is still reachable is not.
 - Constant shift counts outside the operand width, runtime rotates of a
   width that is not a power of two, and source signed-right-shift forms whose
   result depends on implementation-defined C behavior.
