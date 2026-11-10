@@ -40,8 +40,10 @@ def test_compile_c_accepts_source_keyword_and_rejects_unknown_opt_level() -> Non
     circuit = qcc.compile_c(source=source, function="identity", opt=0)
     assert circuit.layout is not None
 
-    with pytest.raises(ValueError, match="between 0 and 2"):
-        qcc.compile_c(source, function="identity", opt=3)
+    assert qcc.compile_c(source, function="identity", opt=3).layout is not None
+
+    with pytest.raises(ValueError, match="between 0 and 3"):
+        qcc.compile_c(source, function="identity", opt=4)
 
 
 def test_optimized_reports_include_measured_level_snapshots() -> None:

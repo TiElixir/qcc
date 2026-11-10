@@ -4,6 +4,11 @@ LLVM's textual format is intentionally broad and changes slightly between
 Clang releases. This parser therefore ignores harmless module attributes and
 metadata declarations, but validates every instruction it sees. The accepted
 program shape is an integer-typed function with an acyclic control-flow graph.
+
+Direct calls and the integer intrinsics that newer Clang releases emit for
+ordinary C (``llvm.umin`` for ``a < b ? a : b`` and friends) are parsed as
+``call`` instructions and then expanded by :mod:`qcc.frontend.legalize`, so
+every later stage only ever sees primitive integer operations.
 """
 
 from __future__ import annotations
@@ -13,7 +18,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from qcc.errors import LLVMParseError, SourceLocation, UnsupportedConstructError
+from qcc.errors import (
+    CompilerError,
+    LLVMParseError,
+    SourceLocation,
+    UnsupportedConstructError,
+)
 from qcc.ir.ssa import (
     BasicBlock,
     Function,
@@ -94,11 +104,45 @@ _UNSUPPORTED_OPS = frozenset(
         "extractelement",
         "insertelement",
         "shufflevector",
-        "freeze",
         "va_arg",
         "landingpad",
     }
 )
+
+# Integer intrinsics with a primitive expansion in qcc.frontend.legalize,
+# mapped to their argument count.  The overload suffix (``.i8``) is dropped
+# when the call is parsed.
+SUPPORTED_INTRINSICS: dict[str, int] = {
+    "llvm.umin": 2,
+    "llvm.umax": 2,
+    "llvm.smin": 2,
+    "llvm.smax": 2,
+    "llvm.abs": 2,
+    "llvm.ctpop": 1,
+    "llvm.ctlz": 2,
+    "llvm.cttz": 2,
+    "llvm.bswap": 1,
+    "llvm.bitreverse": 1,
+    "llvm.fshl": 3,
+    "llvm.fshr": 3,
+    "llvm.uadd.sat": 2,
+    "llvm.usub.sat": 2,
+}
+# Intrinsics that carry no value semantics and can be dropped.
+_IGNORED_INTRINSIC_PREFIXES = (
+    "llvm.lifetime.",
+    "llvm.dbg.",
+    "llvm.assume",
+    "llvm.donothing",
+    "llvm.experimental.noalias.scope.decl",
+    "llvm.pseudoprobe",
+)
+_CALL_RE = re.compile(r"^(?:(?:tail|musttail|notail)\s+)?call\b\s*(?P<rest>.*)$")
+_CALLEE_RE = re.compile(
+    r"(?P<callee>[@%](?:\"(?:[^\"\\]|\\.)*\"|[A-Za-z0-9$._-]+))\s*\("
+)
+_INLINE_ASM_RE = re.compile(r"(?:^|\s)asm\s")
+_ATTRIBUTE_GROUP_RE = re.compile(r"\b[A-Za-z_]+\([^()]*\)")
 
 
 def _location(
@@ -685,6 +729,137 @@ def _typed_operand(
     return value_type, _operand(match.group("operand"), value_type, values, location)
 
 
+def _call_return_type(prefix: str) -> str:
+    """Classify the return type named before a call's callee."""
+
+    cleaned = _ATTRIBUTE_GROUP_RE.sub(" ", prefix)
+    for token in cleaned.split():
+        if _TYPE_RE.fullmatch(token):
+            return token
+        if token == "void":
+            return "void"
+        if token == "ptr" or token.endswith("*"):
+            return "ptr"
+        if token in {"half", "bfloat", "float", "double", "fp128", "x86_fp80"}:
+            return "float"
+        if token[0] in "<{[%":
+            return "aggregate"
+    return "unknown"
+
+
+def _parse_call(
+    rest: str,
+    result_name: str | None,
+    values: dict[str, SSAValue],
+    location: SourceLocation,
+    metadata: tuple[MetadataAttachment, ...],
+    *,
+    forward_names: set[str] | None,
+    defined_functions: frozenset[str],
+) -> Instruction | None:
+    """Parse a direct call to a supported intrinsic or a defined function."""
+
+    if _INLINE_ASM_RE.search(rest.split('"', 1)[0]):
+        raise UnsupportedConstructError(
+            "inline asm",
+            "inline asm is not supported; qcc compiles pure integer functions "
+            "and cannot give a machine instruction a reversible meaning",
+            location,
+        )
+    callee_match = _CALLEE_RE.search(rest)
+    if callee_match is None:
+        raise UnsupportedConstructError(
+            "LLVM instruction 'call'",
+            "unsupported LLVM instruction 'call'; function calls are only "
+            "supported when they name a function defined in the same file",
+            location,
+        )
+    callee_text = callee_match.group("callee")
+    if callee_text.startswith("%"):
+        raise UnsupportedConstructError(
+            "function pointer",
+            f"indirect call through {callee_text}; function pointers are not "
+            "supported because the callee must be known at compile time",
+            location,
+        )
+    callee = _normalize_name(callee_text, "@")
+    if callee.startswith(_IGNORED_INTRINSIC_PREFIXES):
+        return None
+
+    intrinsic: str | None = None
+    if callee.startswith("llvm."):
+        intrinsic = next(
+            (
+                name
+                for name in SUPPORTED_INTRINSICS
+                if callee == name or callee.startswith(f"{name}.")
+            ),
+            None,
+        )
+        if intrinsic is None:
+            raise UnsupportedConstructError(
+                f"intrinsic {callee}",
+                f"unsupported LLVM intrinsic call @{callee}; supported integer "
+                "intrinsics are "
+                + ", ".join(sorted(name[5:] for name in SUPPORTED_INTRINSICS)),
+                location,
+            )
+    elif callee not in defined_functions:
+        raise UnsupportedConstructError(
+            f"call to external function {callee}",
+            f"call to external function @{callee}; function calls are only "
+            "supported when the callee is defined in the same file, because "
+            "qcc inlines the callee and an external function may have side "
+            "effects",
+            location,
+        )
+
+    return_kind = _call_return_type(rest[: callee_match.start()])
+    if _TYPE_RE.fullmatch(return_kind) is None:
+        raise UnsupportedConstructError(
+            f"call returning {return_kind}",
+            f"call to @{callee} returns {return_kind}; only calls that return "
+            "one fixed-width integer are supported",
+            location,
+        )
+    return_type = _parse_type(return_kind, location)
+    open_index = callee_match.end() - 1
+    close_index = _find_matching(rest, open_index)
+    if close_index < 0:
+        raise LLVMParseError("unterminated call argument list", location)
+    argument_text = rest[open_index + 1 : close_index].strip()
+    operands: list[SSAValue | IntConstant] = []
+    for item in _split_top_level(argument_text) if argument_text else []:
+        tokens = _ATTRIBUTE_GROUP_RE.sub(" ", item).split()
+        if len(tokens) < 2 or _TYPE_RE.fullmatch(tokens[0]) is None:
+            raise UnsupportedConstructError(
+                "non-integer call argument",
+                f"call to @{callee} passes {item!r}; only fixed-width integer "
+                "arguments are supported",
+                location,
+            )
+        argument_type = _parse_type(tokens[0], location)
+        operands.append(_operand(tokens[-1], argument_type, values, location))
+    if intrinsic is not None and len(operands) != SUPPORTED_INTRINSICS[intrinsic]:
+        raise LLVMParseError(
+            f"@{callee} expects {SUPPORTED_INTRINSICS[intrinsic]} argument(s), "
+            f"got {len(operands)}",
+            location,
+        )
+    result = _result(
+        result_name, return_type, values, location, forward_names=forward_names
+    )
+    return Instruction(
+        "call",
+        result=result,
+        type=return_type,
+        operands=tuple(operands),
+        source_location=location,
+        metadata=metadata,
+        callee=intrinsic or callee,
+    )
+
+
 def _parse_instruction(
     line: str,
     *,
@@ -694,7 +869,10 @@ def _parse_instruction(
     function_return_type: IntType | VoidType,
     forward_names: set[str] | None = None,
     debug_locations: Mapping[int, SourceLocation] | None = None,
-) -> Instruction:
+    defined_functions: frozenset[str] = frozenset(),
+) -> Instruction | None:
+    """Parse one instruction line; ``None`` means a value-free no-op."""
+
     base, metadata = _extract_metadata(
         line.strip(),
         _location(source_name, line_number, line),
@@ -712,8 +890,17 @@ def _parse_instruction(
     else:
         body = base
 
-    if re.match(r"^(?:(?:tail|musttail|notail)\s+)?call(?:\s|$)", body):
-        _unsupported_opcode("call", location)
+    call_match = _CALL_RE.match(body)
+    if call_match is not None:
+        return _parse_call(
+            call_match.group("rest"),
+            result_name,
+            values,
+            location,
+            metadata,
+            forward_names=forward_names,
+            defined_functions=defined_functions,
+        )
 
     opcode_match = re.match(r"^([A-Za-z][A-Za-z0-9_.-]*)(?:\s+(.*))?$", body)
     if opcode_match is None:
@@ -738,7 +925,7 @@ def _parse_instruction(
 
     if opcode in _BINARY_OPS:
         match = re.match(
-            r"^(?:(?P<flags>(?:(?:nuw|nsw|exact)\s+)+))?"
+            r"^(?:(?P<flags>(?:(?:nuw|nsw|exact|disjoint)\s+)+))?"
             r"(?P<type>i[1-9][0-9]*)\s+(?P<operands>.+)$",
             rest,
         )
@@ -981,6 +1168,23 @@ def _parse_instruction(
             metadata=metadata,
         )
 
+    if opcode == "freeze":
+        # ``freeze`` pins an undef/poison operand to one arbitrary value.  A
+        # reversible circuit computes a definite bit pattern on every wire, so
+        # the identity is a valid refinement.
+        value_type, frozen = _typed_operand(rest, values, location)
+        result = _result(
+            result_name, value_type, values, location, forward_names=forward_names
+        )
+        return Instruction(
+            "copy",
+            result=result,
+            type=value_type,
+            operands=(frozen,),
+            source_location=location,
+            metadata=metadata,
+        )
+
     if opcode == "alloca":
         location = _source_keyword_location(
             source_name,
@@ -997,12 +1201,21 @@ def _parse_parameters(
     source_name: str,
     line_number: int,
     location: SourceLocation,
-) -> tuple[Parameter, ...]:
+) -> tuple[tuple[Parameter, ...], tuple[str, ...]]:
+    """Parse a parameter list into integer parameters and pointer names.
+
+    A pointer parameter is not an error by itself: the caller reports it
+    against the instruction that first uses it, which is where the user's
+    source actually touches memory.
+    """
+
     if not text.strip():
-        return ()
+        return (), ()
     parameters: list[Parameter] = []
+    pointers: list[str] = []
     used_names: set[str] = set()
     next_implicit = 0
+    name_pattern = r"%(?:[A-Za-z$._-][A-Za-z0-9$._-]*|[0-9]+|\"(?:[^\"\\]|\\.)*\")"
     for item in _split_top_level(text):
         if item == "...":
             raise UnsupportedConstructError(
@@ -1010,23 +1223,23 @@ def _parse_parameters(
                 "variadic functions are not supported in the integer v0.1 subset",
                 location,
             )
-        if "*" in item or re.search(r"\bptr\b", item):
-            pointer_location = location
-            unresolved = "*" in item and "(" not in item
-            if unresolved:
-                pointer_location = _source_keyword_location(
-                    source_name,
-                    ("[", "->"),
-                    location,
-                    after_line=location.line,
-                )
-            raise UnsupportedConstructError(
-                "unresolved pointer" if unresolved else "function pointer",
-                "unresolved pointers and variable-index memory access are not supported"
-                if unresolved
-                else "function pointers are not supported",
-                pointer_location,
+        name_matches = re.findall(name_pattern, item)
+        if name_matches:
+            name = _ssa_name(name_matches[-1], location)
+        else:
+            while str(next_implicit) in used_names:
+                next_implicit += 1
+            name = str(next_implicit)
+            next_implicit += 1
+        if name in used_names:
+            raise LLVMParseError(
+                f"function parameter %{name} is defined more than once",
+                location,
             )
+        used_names.add(name)
+        if "*" in item or re.search(r"\bptr\b", item):
+            pointers.append(name)
+            continue
         type_match = re.search(
             r"(?<![A-Za-z0-9_])i[1-9][0-9]*(?![A-Za-z0-9_])",
             item,
@@ -1043,30 +1256,13 @@ def _parse_parameters(
                 location,
             )
         value_type = _parse_type(type_match.group(0), location)
-        name_matches = re.findall(
-            r"%(?:[A-Za-z$._-][A-Za-z0-9$._-]*|[0-9]+|\"(?:[^\"\\]|\\.)*\")",
-            item,
-        )
-        if name_matches:
-            name = _ssa_name(name_matches[-1], location)
-        else:
-            while str(next_implicit) in used_names:
-                next_implicit += 1
-            name = str(next_implicit)
-            next_implicit += 1
-        if name in used_names:
-            raise LLVMParseError(
-                f"function parameter %{name} is defined more than once",
-                location,
-            )
-        used_names.add(name)
         attributes = tuple(
             token
             for token in item.replace(type_match.group(0), " ").split()
             if not token.startswith("%")
         )
         parameters.append(Parameter(name, value_type, attributes))
-    return tuple(parameters)
+    return tuple(parameters), tuple(pointers)
 
 
 def _parse_function_header(
@@ -1081,6 +1277,7 @@ def _parse_function_header(
     tuple[Parameter, ...],
     tuple[str, ...],
     SourceLocation,
+    tuple[str, ...],
 ]:
     header_location = _location(source_name, line_number, header)
     _, header_metadata = _extract_metadata(header, header_location)
@@ -1150,7 +1347,7 @@ def _parse_function_header(
     return_type: IntType | VoidType = (
         VoidType() if return_text == "void" else _parse_type(return_text, location)
     )
-    parameters = _parse_parameters(
+    parameters, pointers = _parse_parameters(
         after_name[1:close],
         source_name=source_name,
         line_number=line_number,
@@ -1158,7 +1355,59 @@ def _parse_function_header(
     )
     attributes_text = after_name[close + 1 :].strip()
     attributes = tuple(attributes_text.split()) if attributes_text else ()
-    return name, return_type, parameters, attributes, location
+    return name, return_type, parameters, attributes, location, pointers
+
+
+def _reject_pointer_parameters(
+    lines: list[str],
+    body_start: int,
+    pointers: tuple[str, ...],
+    *,
+    source_name: str,
+    function_location: SourceLocation,
+    debug_locations: Mapping[int, SourceLocation] | None,
+) -> None:
+    """Raise the diagnostic for a function that takes pointer parameters.
+
+    The error points at the first instruction that uses a pointer, so an
+    indexed load is reported on the source line that dereferences it rather
+    than on the function signature.
+    """
+
+    for index in range(body_start, len(lines)):
+        body_line = _strip_comment(lines[index])
+        if body_line.strip() == "}":
+            break
+        for name in pointers:
+            use = re.search(
+                rf"%(?:{re.escape(name)}|\"{re.escape(name)}\")(?![A-Za-z0-9$._-])",
+                body_line,
+            )
+            if use is None:
+                continue
+            if _CALL_RE.match(body_line.split("=", 1)[-1].strip()) and re.match(
+                r"\s*\(", body_line[use.end() :]
+            ):
+                raise UnsupportedConstructError(
+                    "function pointer",
+                    f"indirect call through %{name}; function pointers are not "
+                    "supported because the callee must be known at compile time",
+                    function_location,
+                )
+            fallback = _location(source_name, index + 1, body_line)
+            _, attachments = _extract_metadata(body_line.strip(), fallback)
+            raise UnsupportedConstructError(
+                "unresolved pointer",
+                f"memory access through pointer parameter %{name}; unresolved "
+                "pointers and variable-index memory access are not supported",
+                _location_from_dbg(attachments, fallback, debug_locations),
+            )
+    raise UnsupportedConstructError(
+        "pointer parameter",
+        f"pointer parameter %{pointers[0]}; pointers and memory are not "
+        "supported, pass fixed-width integers by value",
+        function_location,
+    )
 
 
 def _validate_function(function: Function) -> None:
@@ -1255,6 +1504,7 @@ def _parse_function(
     *,
     source_name: str,
     debug_locations: Mapping[int, SourceLocation] | None = None,
+    defined_functions: frozenset[str] = frozenset(),
 ) -> tuple[Function, int]:
     line_number = start + 1
     header = _strip_comment(lines[start]).strip()
@@ -1267,7 +1517,7 @@ def _parse_function(
                 _location(source_name, line_number, lines[start]),
             )
         header += " " + _strip_comment(lines[cursor]).strip()
-    name, return_type, parameters, attributes, function_location = (
+    name, return_type, parameters, attributes, function_location, pointers = (
         _parse_function_header(
             header,
             source_name=source_name,
@@ -1275,6 +1525,15 @@ def _parse_function(
             debug_locations=debug_locations,
         )
     )
+    if pointers:
+        _reject_pointer_parameters(
+            lines,
+            cursor + 1,
+            pointers,
+            source_name=source_name,
+            function_location=function_location,
+            debug_locations=debug_locations,
+        )
     for body_line_index in range(cursor + 1, len(lines)):
         body_line = _strip_comment(lines[body_line_index])
         if body_line.strip() == "}":
@@ -1381,7 +1640,11 @@ def _parse_function(
             function_return_type=return_type,
             forward_names=forward_names,
             debug_locations=debug_locations,
+            defined_functions=defined_functions,
         )
+        if instruction is None:
+            cursor += 1
+            continue
         if instruction.opcode == "phi" and any(
             existing.opcode != "phi" for existing in instructions
         ):
@@ -1398,8 +1661,48 @@ def _parse_function(
     )
 
 
-def parse_module(text: str, source_name: str = "<llvm>") -> Module:
-    """Parse bounded integer LLVM IR into a :class:`Module`."""
+_DEFINE_NAME_RE = re.compile(
+    r"^define\b[^@]*@(?P<name>\"(?:[^\"\\]|\\.)*\"|[A-Za-z$._-][A-Za-z0-9$._-]*)"
+)
+_GLOBAL_REFERENCE_RE = re.compile(
+    r"@(\"(?:[^\"\\]|\\.)*\"|[A-Za-z$._-][A-Za-z0-9$._-]*)"
+)
+
+
+def _defined_name(line: str) -> str | None:
+    match = _DEFINE_NAME_RE.match(line)
+    return None if match is None else _normalize_name(match.group("name"), "@")
+
+
+def _function_end(lines: list[str], start: int) -> int:
+    """Return the index just past the ``}`` that closes a function body."""
+
+    for index in range(start, len(lines)):
+        if _strip_comment(lines[index]).strip() == "}":
+            return index + 1
+    return len(lines)
+
+
+def parse_module(
+    text: str,
+    source_name: str = "<llvm>",
+    *,
+    strict: bool = True,
+    legalize: bool = True,
+) -> Module:
+    """Parse bounded integer LLVM IR into a :class:`Module`.
+
+    ``strict`` (the default) raises on the first construct outside the
+    supported subset anywhere in the module.  With ``strict=False`` a
+    function that cannot be accepted is recorded in ``Module.rejected`` and
+    parsing continues, so one unsupported helper does not make the rest of a
+    file uncompilable; :meth:`Module.get_function` raises the stored
+    diagnostic if that function is requested.
+
+    ``legalize`` runs :func:`qcc.frontend.legalize.legalize_module`, which
+    inlines direct calls and expands intrinsics and variable shifts, so the
+    returned functions contain primitive operations only.
+    """
 
     if not isinstance(text, str):
         raise TypeError("LLVM input must be text")
@@ -1409,8 +1712,15 @@ def parse_module(text: str, source_name: str = "<llvm>") -> Module:
     debug_locations = _debug_locations(text, source_name)
     lines = text.splitlines()
     functions: list[Function] = []
+    rejected: dict[str, Exception] = {}
+    rejected_globals: dict[str, CompilerError] = {}
     module_metadata: list[str] = []
     target_triple: str | None = None
+    defined_functions = frozenset(
+        name
+        for name in (_defined_name(_strip_comment(line).strip()) for line in lines)
+        if name is not None
+    )
     cursor = 0
     while cursor < len(lines):
         raw = _strip_comment(lines[cursor])
@@ -1420,12 +1730,28 @@ def parse_module(text: str, source_name: str = "<llvm>") -> Module:
             cursor += 1
             continue
         if stripped.startswith("define "):
-            function, cursor = _parse_function(
-                lines,
-                cursor,
-                source_name=source_name,
-                debug_locations=debug_locations,
-            )
+            end = _function_end(lines, cursor)
+            try:
+                for body_line in lines[cursor:end]:
+                    for reference in _GLOBAL_REFERENCE_RE.findall(body_line):
+                        failure = rejected_globals.get(_normalize_name(reference, ""))
+                        if failure is not None:
+                            raise failure
+                function, _ = _parse_function(
+                    lines,
+                    cursor,
+                    source_name=source_name,
+                    debug_locations=debug_locations,
+                    defined_functions=defined_functions,
+                )
+            except CompilerError as error:
+                if strict:
+                    raise
+                name = _defined_name(stripped) or f"<function at line {line_number}>"
+                rejected.setdefault(name, error)
+                cursor = end
+                continue
+            cursor = end
             if any(existing.name == function.name for existing in functions):
                 raise LLVMParseError(
                     f"function @{function.name} is defined more than once",
@@ -1483,28 +1809,41 @@ def parse_module(text: str, source_name: str = "<llvm>") -> Module:
                     if re.search(rf"\b{re.escape(needle)}\b\s*=", source_line):
                         fallback = SourceLocation(source_name, source_line_number, 1)
                         break
-            raise UnsupportedConstructError(
+            global_error = UnsupportedConstructError(
                 "global definition",
                 "global mutable state, global variables, and global initializers "
-                "are not supported in v0.2",
+                "are not supported",
                 fallback,
             )
+            if strict:
+                raise global_error
+            if name_match is not None:
+                rejected_globals[name_match.group(1)] = global_error
+            module_metadata.append(stripped)
+            cursor += 1
+            continue
         raise LLVMParseError(
             f"unrecognized top-level LLVM construct {stripped.split()[0]!r}",
             _location(source_name, line_number, raw),
         )
 
-    if not functions:
+    if not functions and not rejected:
         raise LLVMParseError(
             "LLVM module does not contain a function definition",
             SourceLocation(source_name),
         )
-    return Module(
+    module = Module(
         FunctionCollection(functions),
         source_name=source_name,
         target_triple=target_triple,
         metadata=tuple(module_metadata),
+        rejected=rejected,
     )
+    if legalize:
+        from qcc.frontend.legalize import legalize_module
+
+        module = legalize_module(module, strict=strict)
+    return module
 
 
 def lookup_function(module: Module, name: str) -> Function:

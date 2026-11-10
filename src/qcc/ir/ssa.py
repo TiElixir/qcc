@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import overload
 
 from qcc.errors import SourceLocation
@@ -190,9 +191,11 @@ class Instruction:
     ``type`` is the result type for value-producing operations and the return
     type for ``ret``.  For ``icmp`` it is ``i1`` and ``operand_type`` carries
     the compared integer type.  ``targets`` stores branch destination labels,
-    while ``incoming`` stores the edges of a ``phi``.  The generic
-    representation keeps the lowering API stable without requiring one class
-    for each LLVM opcode.
+    while ``incoming`` stores the edges of a ``phi``.  ``callee`` names the
+    function or normalized intrinsic (``llvm.umin``) of a ``call``; calls only
+    exist between parsing and legalization, which expands or inlines them.
+    The generic representation keeps the lowering API stable without
+    requiring one class for each LLVM opcode.
     """
 
     opcode: str
@@ -207,6 +210,7 @@ class Instruction:
     metadata: tuple[MetadataAttachment, ...] = ()
     targets: tuple[str, ...] = ()
     incoming: tuple[PhiIncoming, ...] = ()
+    callee: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "opcode", self.opcode.lower())
@@ -384,6 +388,12 @@ class Instruction:
                 )
             else:
                 body = "br <malformed>"
+        elif opcode == "call":
+            arguments = ", ".join(
+                f"{item.type} {self._operand_text(item)}" for item in self.operands
+            )
+            type_text = f"{self.type} " if self.type is not None else ""
+            body = f"call {type_text}@{self.callee}({arguments})"
         elif opcode == "ret":
             if not self.operands:
                 body = "ret void"
@@ -409,6 +419,8 @@ class Instruction:
             result += f", predicate={self.predicate!r}"
         if self.targets:
             result += f", targets={self.targets!r}"
+        if self.callee is not None:
+            result += f", callee={self.callee!r}"
         if self.incoming:
             result += f", incoming={self.incoming!r}"
         if self.source_location is not None:
@@ -688,16 +700,35 @@ class Module:
     source_name: str = "<llvm>"
     target_triple: str | None = None
     metadata: tuple[str, ...] = ()
+    rejected: Mapping[str, Exception] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.functions, FunctionCollection):
             object.__setattr__(self, "functions", FunctionCollection(self.functions))
         object.__setattr__(self, "metadata", tuple(self.metadata))
+        object.__setattr__(self, "rejected", MappingProxyType(dict(self.rejected)))
+
+    @property
+    def function_names(self) -> tuple[str, ...]:
+        """Every function defined by the source, accepted or rejected."""
+
+        return (*self.functions.keys(), *self.rejected)
 
     def get_function(self, name: str) -> Function:
+        """Return an accepted function, or raise why it was rejected.
+
+        A module parsed with ``strict=False`` keeps going after a function
+        that is outside the supported subset.  The diagnostic is stored and
+        raised here, so an unsupported helper only matters to callers that
+        actually ask for it.
+        """
+
         normalized = name.lstrip("@")
         function = self.functions.get(normalized)
         if function is None:
+            failure = self.rejected.get(normalized)
+            if failure is not None:
+                raise failure
             raise KeyError(name)
         return function
 

@@ -49,8 +49,8 @@ def _optimization_level(value: str) -> int:
         ) from exc
     if level < 0:
         raise argparse.ArgumentTypeError("--opt expects a non-negative integer")
-    if level > 2:
-        raise argparse.ArgumentTypeError("--opt expects O0, O1, or O2")
+    if level > 3:
+        raise argparse.ArgumentTypeError("--opt expects O0, O1, O2, or O3")
     return level
 
 
@@ -95,7 +95,10 @@ def _add_common_options(parser: argparse.ArgumentParser, *, emit: str) -> None:
         type=_optimization_level,
         default=0,
         metavar="LEVEL",
-        help="optimizer level (default: 0; O0/O1/O2 are accepted)",
+        help=(
+            "optimizer level O0-O3 (default: 0). O0 is the Bennett baseline, "
+            "O2 adds SSA and gate cleanup, O3 is the dataflow synthesizer"
+        ),
     )
     parser.add_argument(
         "--samples",
@@ -124,6 +127,46 @@ def build_parser() -> argparse.ArgumentParser:
 
     check_parser = commands.add_parser("check", help="compile and validate the circuit")
     _add_common_options(check_parser, emit="stats")
+
+    verify_parser = commands.add_parser(
+        "verify",
+        help="compile, then check the circuit against the C function's semantics",
+        description=(
+            "Compile a function and simulate the circuit against a reference "
+            "evaluation of the same function. Every input is tried when the "
+            "arguments total at most --exhaustive-bits bits; otherwise a "
+            "seeded random sample is used. The check covers the output "
+            "value, preservation of the inputs, and clean work qubits."
+        ),
+    )
+    verify_parser.add_argument("source", metavar="SOURCE", help="C source file")
+    verify_parser.add_argument(
+        "--function", default="main", metavar="NAME", help="function to verify"
+    )
+    verify_parser.add_argument(
+        "--opt",
+        type=_optimization_level,
+        default=3,
+        metavar="LEVEL",
+        help="optimizer level to verify (default: 3)",
+    )
+    verify_parser.add_argument(
+        "--exhaustive-bits",
+        type=_positive_samples,
+        default=20,
+        metavar="BITS",
+        help="sweep all inputs up to this many input bits (default: 20)",
+    )
+    verify_parser.add_argument(
+        "--samples",
+        type=_positive_samples,
+        default=4096,
+        metavar="N",
+        help="random inputs to try when the sweep is too large (default: 4096)",
+    )
+    verify_parser.add_argument(
+        "--seed", type=int, default=0, metavar="SEED", help="sampling seed"
+    )
 
     return parser
 
@@ -445,15 +488,53 @@ def _emit_for_command(args: argparse.Namespace, result: Any, circuit: Any) -> st
     raise CLIError(f"unsupported output format {args.emit!r}")
 
 
+def _run_verify(args: argparse.Namespace, source: Path) -> int:
+    import qcc
+    from qcc.verify import verify
+
+    function = qcc.parse_c(str(source), args.function)
+    circuit = qcc.compile_c(function, function=function.name, opt=args.opt)
+    result = verify(
+        circuit,
+        function,
+        exhaustive_limit=args.exhaustive_bits,
+        samples=args.samples,
+        seed=args.seed,
+    )
+    report = circuit.report()
+    print(
+        f"{'ok' if result.ok else 'FAILED'}: {result.describe()} "
+        f"[O{args.opt}: {report.qubit_count} qubits, "
+        f"{report.gate_count} gates, T estimate {report.t_count}]",
+        file=sys.stdout if result.ok else sys.stderr,
+    )
+    return 0 if result.ok else 1
+
+
+def _clang_ir(source: Path) -> str | None:
+    """Return Clang's LLVM IR for ``source``, or ``None`` if unavailable."""
+
+    try:
+        from qcc.frontend.clang import compile_c as emit_llvm
+
+        return emit_llvm(source)
+    except Exception:  # noqa: BLE001 - --dump-ir is best effort
+        return None
+
+
 def _run(args: argparse.Namespace) -> int:
     source = Path(args.source)
     if not source.is_file():
         raise CLIError(f"source file not found: {source}")
+    if args.command == "verify":
+        return _run_verify(args, source)
     result = _invoke_compiler(args, source)
     circuit = _circuit_from_result(result)
 
     if args.dump_ir:
         ir = _ir_from_result(result)
+        if ir is None and compile_c is None:
+            ir = _clang_ir(source)
         if ir is None:
             print("qcc: warning: compiler returned no textual IR", file=sys.stderr)
         else:

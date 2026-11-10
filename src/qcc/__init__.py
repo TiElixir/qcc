@@ -25,6 +25,8 @@ from qcc.ir.netlist import (
     QubitAllocator,
     ResourceCounts,
 )
+from qcc.ir.ssa import Function as _SSAFunction
+from qcc.ir.ssa import Module as _SSAModule
 from qcc.opt.gates import (
     normalize_level,
     optimize,
@@ -317,6 +319,68 @@ def _record_optimization(
     )
 
 
+def _optimized(circuit: Circuit, requested: int, effective: int) -> Circuit:
+    """Run the gate optimizer, keeping the level the caller actually asked for.
+
+    The two differ only when level 3 was requested for an input the
+    synthesizer cannot take; the report must then show 3 requested, 2 run.
+    """
+
+    optimized = optimize_circuit(circuit, effective)
+    if requested == effective:
+        return optimized
+    return Circuit(
+        optimized.gates,
+        num_qubits=optimized.num_qubits,
+        layout=optimized.layout,
+        domain=optimized.domain,
+        name=optimized.name,
+        optimization_level=optimized.optimization_level,
+        requested_optimization_level=requested,
+        baseline=optimized.baseline,
+    )
+
+
+def _synthesize(
+    function: _SSAFunction, function_name: str | None, *, requested: int
+) -> Any:
+    """Compile a typed SSA function with the level-3 dataflow synthesizer.
+
+    The level-0 circuit for the same function is attached as the baseline so
+    a resource report can show measured before/after numbers.
+    """
+
+    from qcc.synth import synthesize_function
+
+    circuit = _construct_circuit(synthesize_function(function))
+    if not isinstance(circuit, Circuit):
+        return circuit
+    baseline: Any | None
+    try:
+        baseline = _construct_circuit(
+            lower_ssa(function, function_name=function_name, optimization_level=0)
+        )
+    except (CompilerError, ValueError):
+        # The baseline only feeds the before/after report; a function the
+        # level-0 lowering cannot handle still compiles at level 3.
+        baseline = None
+    gates = optimize_gates(
+        circuit.gates,
+        2,
+        initial_zero=(int(qubit) for qubit in circuit.ancillas),
+    )
+    return Circuit(
+        gates,
+        num_qubits=circuit.num_qubits,
+        layout=circuit.layout,
+        domain=circuit.domain,
+        name=circuit.name,
+        optimization_level=3,
+        requested_optimization_level=requested,
+        baseline=baseline if isinstance(baseline, Circuit) else None,
+    )
+
+
 def _looks_like_circuit(value: Any) -> bool:
     if value is None:
         return False
@@ -353,7 +417,7 @@ def _parse_frontend_text(value: Any, *, source_name: str = "<llvm>") -> Any:
         parser = getattr(module, "parse_module", None) or getattr(module, "parse", None)
         if callable(parser):
             try:
-                return parser(value, source_name=source_name)
+                return parser(value, source_name=source_name, strict=False)
             except TypeError:
                 return parser(value)
     raise ImportError("qcc frontend returned LLVM text but no LLVM parser is available")
@@ -370,7 +434,32 @@ def _materialize_frontend_result(value: Any, *, source_name: str = "<llvm>") -> 
     return value
 
 
+def _select_from_module(module: _SSAModule, function: str | None) -> _SSAFunction:
+    """Pick the requested function.
+
+    The default entry name ``main`` also selects the only function of a
+    one-function source, so small examples need no ``function=`` argument.
+    Any other name must exist: compiling a different function than the one
+    asked for would be a silent wrong answer.
+    """
+
+    names = module.function_names
+    if function is not None and function.lstrip("@") in names:
+        # Raises the stored diagnostic if this function was rejected.
+        return module.get_function(function)
+    if len(names) == 1 and function in (None, "main"):
+        return module.get_function(names[0])
+    available = ", ".join(names)
+    raise CompilerError(
+        f"function {function!r} is not defined in {module.source_name}; "
+        f"pass one of: {available}",
+        code="unknown-function",
+    )
+
+
 def _select_function(value: Any, function: str | None) -> Any:
+    if isinstance(value, _SSAModule):
+        return _select_from_module(value, function)
     if _looks_like_circuit(value):
         return value
     if isinstance(value, tuple):
@@ -580,6 +669,12 @@ def compile_c(
         if enabled and isinstance(source_or_path, Circuit):
             return optimize_circuit(source_or_path, effective_opt)
         return source_or_path
+    if effective_opt >= 3 and isinstance(source_or_path, _SSAFunction):
+        return _synthesize(source_or_path, function, requested=normalized_opt)
+    if effective_opt >= 3 and _looks_like_ssa(source_or_path):
+        # Structural (untyped) SSA has no dataflow form; use the best level
+        # the baseline lowering offers and report that level honestly.
+        effective_opt = 2
     if _looks_like_ssa(source_or_path):
         selected_ssa = (
             optimize_ssa(source_or_path, effective_opt) if enabled else source_or_path
@@ -592,7 +687,7 @@ def compile_c(
         )
         circuit = _construct_circuit(lowered)
         if enabled and isinstance(circuit, Circuit):
-            return optimize_circuit(circuit, effective_opt)
+            return _optimized(circuit, normalized_opt, effective_opt)
         return _record_optimization(
             circuit, requested=normalized_opt, effective=effective_opt
         )
@@ -600,7 +695,8 @@ def compile_c(
     _, _, source_path = _source_and_path(source_or_path)
     source_name = str(source_path) if source_path is not None else "<stdin>"
     frontend_result = _materialize_frontend_result(
-        _invoke_frontend(frontend, source_or_path, function, effective_opt),
+        # Clang has no level beyond -O2 that helps here.
+        _invoke_frontend(frontend, source_or_path, function, min(effective_opt, 2)),
         source_name=source_name,
     )
     selected = _select_function(frontend_result, function)
@@ -610,6 +706,10 @@ def compile_c(
         return _record_optimization(
             selected, requested=normalized_opt, effective=effective_opt
         )
+    if effective_opt >= 3:
+        if isinstance(selected, _SSAFunction):
+            return _synthesize(selected, function, requested=normalized_opt)
+        effective_opt = 2
     if enabled:
         selected = optimize_ssa(selected, effective_opt)
     lowered = lower_ssa(
@@ -620,10 +720,32 @@ def compile_c(
     )
     circuit = _construct_circuit(lowered)
     if enabled and isinstance(circuit, Circuit):
-        return optimize_circuit(circuit, effective_opt)
+        return _optimized(circuit, normalized_opt, effective_opt)
     return _record_optimization(
         circuit, requested=normalized_opt, effective=effective_opt
     )
+
+
+def parse_c(source_or_path: Any, function: str | None = "main") -> _SSAFunction:
+    """Compile C source text or a C path to one legalized SSA function.
+
+    This is the frontend half of :func:`compile_c`: Clang, the LLVM parser,
+    and legalization, with calls inlined and intrinsics expanded.  The result
+    is what every optimization level lowers, and what
+    :func:`qcc.verify.verify` uses as the reference semantics.
+    """
+
+    frontend = _find_frontend_callable()
+    _, _, source_path = _source_and_path(source_or_path)
+    source_name = str(source_path) if source_path is not None else "<stdin>"
+    module = _materialize_frontend_result(
+        _invoke_frontend(frontend, source_or_path, function, 1),
+        source_name=source_name,
+    )
+    selected = _select_function(module, function)
+    if not isinstance(selected, _SSAFunction):
+        raise CompilerError(f"{source_name} did not produce an SSA function")
+    return selected
 
 
 def _input_values(circuit: Any, inputs: Any) -> dict[str, int]:
@@ -795,6 +917,7 @@ __all__ = [
     "optimize_gates",
     "optimize_ssa",
     "lower_ssa",
+    "parse_c",
     "resource_report",
     "simulate",
     "to_qasm3",

@@ -39,12 +39,16 @@ class GateOptimizationStats:
         return self.removed_gates // 2
 
 
+MAX_LEVEL = 3
+
+
 def normalize_level(level: int) -> int:
     """Validate and normalize a public qcc optimization level.
 
     Levels zero and one retain the v0.3 circuit stream.  Level two is the
-    v0.4 optimizer.  Levels above two are intentionally rejected because the
-    v0.4 contract has no semantics for them.
+    v0.4 optimizer.  Level three is the v0.5 dataflow synthesizer in
+    :mod:`qcc.synth`.  Higher levels are rejected rather than treated as an
+    alias, because nothing defines what they would mean.
     """
 
     if isinstance(level, bool):
@@ -53,8 +57,8 @@ def normalize_level(level: int) -> int:
         normalized = _index(level)
     except TypeError as exc:
         raise TypeError("optimization level must be an integer") from exc
-    if normalized < 0 or normalized > 2:
-        raise ValueError("optimization level must be between 0 and 2")
+    if normalized < 0 or normalized > MAX_LEVEL:
+        raise ValueError(f"optimization level must be between 0 and {MAX_LEVEL}")
     return normalized
 
 
