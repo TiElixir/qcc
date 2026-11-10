@@ -1545,6 +1545,12 @@ class _Lowerer:
                 f"{predicate!r}"
             )
         target = self._allocate_result(operation, 1)
+        if first.register.bits == second.register.bits:
+            # A value compared with itself has a constant answer, and the
+            # comparator networks below need two distinct registers.
+            if predicate in {"eq", "uge", "ule", "sge", "sle"}:
+                self.scheduler.x(target.register.bits[0])
+            return
         if predicate == "eq":
             self._emit_equal(first, second, target.register)
         elif predicate == "ne":
