@@ -1,15 +1,26 @@
 # qcc
 
+[![CI](https://github.com/TiElixir/Qmpiler/actions/workflows/ci.yml/badge.svg)](https://github.com/TiElixir/Qmpiler/actions/workflows/ci.yml)
 [![Status: Beta](https://img.shields.io/badge/status-beta-f59e0b.svg)](pyproject.toml)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**qcc** compiles pure C functions into reversible quantum circuits. Clang
-turns the C into LLVM IR, qcc validates that IR with its own parser, and the
-result is an `X`/`CX`/`CCX` network that computes the function into a clean
-output register while leaving its inputs untouched. The circuit can be
-simulated, costed, checked against the C semantics on every input, and emitted
-as OpenQASM 3.
+**qcc** is a compiler. It changes a pure C function into a reversible quantum
+circuit.
+
+A quantum algorithm, for example Grover search, calculates a classical function
+on a superposition of inputs. For this, the function must be a reversible
+circuit. If you write this type of circuit manually, the work is slow and
+errors are easy to make. With qcc, you write the function in C.
+
+qcc uses Clang to change the C source into LLVM IR. Then it makes a circuit
+that contains only `X`, `CX`, and `CCX` gates. The circuit writes the result
+into an output register. It does not change the inputs, and it sets each work
+qubit to zero again.
+
+## Example
+
+This C function is a search condition:
 
 ```c
 #include <stdint.h>
@@ -20,16 +31,47 @@ bool is_solution(uint8_t x) {
 }
 ```
 
+The `verify` command compiles the function. Then it compares the circuit with
+the function for each possible input:
+
 ```console
 $ qcc verify examples/benchmarks.c --function is_solution
 ok: is_solution: verified on all 256 inputs [O3: 43 qubits, 840 gates, T estimate 2401]
 ```
 
-That oracle takes 209 qubits and a T estimate of 66,038 at the baseline level.
-The numbers for every benchmark are measured, not estimated, and regenerated
-by a script:
+A small function gives a small circuit. This function has a 3-bit input:
 
-| Function | Qubits (O0 → O3) | T estimate (O0 → O3) | Reduction |
+```c
+typedef unsigned _BitInt(3) grover_input_t;
+typedef unsigned _BitInt(1) grover_output_t;
+
+grover_output_t grover_oracle(grover_input_t x) {
+    return x == 6;
+}
+```
+
+```console
+$ qcc compile examples/grover_oracle.c --function grover_oracle --opt O3
+OPENQASM 3.0;
+include "stdgates.inc";
+
+qubit[3] x;
+qubit[1] output;
+qubit[1] ancilla;
+
+ccx x[0], x[1], ancilla[0];
+cx x[1], ancilla[0];
+ccx ancilla[0], x[2], output[0];
+cx x[1], ancilla[0];
+ccx x[0], x[1], ancilla[0];
+```
+
+## Measured results
+
+The table compares the baseline level (`O0`) with the highest level (`O3`).
+The file `examples/benchmarks.c` contains the five functions.
+
+| Function | Qubits (`O0` → `O3`) | T estimate (`O0` → `O3`) | Decrease |
 | --- | ---: | ---: | ---: |
 | `add` | 41 → 25 | 448 → 98 | 4.6x |
 | `multiply` | 97 → 33 | 35,840 → 1,281 | 28.0x |
@@ -37,246 +79,140 @@ by a script:
 | `popcount` | 303 → 50 | 3,136 → 686 | 4.6x |
 | `is_solution` | 209 → 43 | 66,038 → 2,401 | 27.5x |
 
-Full rows, including gate counts, depth, and the intermediate `O2` level, are
-in [docs/benchmarks.md](docs/benchmarks.md).
+The T estimate is a usual cost measure for a fault-tolerant quantum computer.
+qcc counts seven T gates for each `CCX` gate. The script
+`scripts/benchmarks.py` measures all these values. Refer to
+[docs/benchmarks.md](docs/benchmarks.md) for the full data.
 
-## How it works
+## Functions
 
-```text
-C source
-  → Clang textual LLVM IR
-  → validated qcc SSA           (calls inlined, intrinsics expanded)
-  → circuit synthesis           (O0–O2: per-instruction Bennett lowering
-                                 O3:    whole-function dataflow synthesis)
-  → X/CX/CCX circuit
-  → simulate · verify · resource report · OpenQASM 3
-```
-
-Every arrow is a validation boundary. A construct qcc cannot compile is a
-hard, located diagnostic; it is never approximated.
-
-## Requirements
-
-- Python 3.10 or newer
-- Clang available as `clang` on `PATH`
-
-The runtime has no third-party Python dependencies. Qiskit is optional and
-only needed for the Qiskit adapter and the Grover demo's statevector path.
+- **Usual C code.** qcc accepts integer arithmetic, comparisons, `if` and
+  `else`, `switch`, shifts, loops with a constant limit, and calls to functions
+  in the same file.
+- **Four optimization levels.** Level `O3` makes the circuit from the data
+  flow of the full function. The other levels change one instruction at a time.
+- **A circuit check.** `qcc verify` compares the circuit with the C function
+  for each input. If the number of inputs is too large, it uses a random
+  sample.
+- **A resource report.** `qcc stats` gives the number of qubits, gates, and
+  T gates, and the circuit depth.
+- **OpenQASM 3 output** with one named register for each function argument.
+- **Clear error messages.** An error message gives the file, the line, and
+  the cause.
+- **No Python dependencies.** Only Python and Clang are necessary.
 
 ## Installation
 
-From a repository checkout:
+1. Make sure that Python 3.10 or a later version is installed.
+2. Make sure that the `clang` command is available.
+3. Get the source code:
 
-```console
-$ python -m pip install -e ".[dev]"
-```
+   ```console
+   $ git clone https://github.com/TiElixir/Qmpiler.git
+   $ cd Qmpiler
+   ```
 
-On Debian or Ubuntu, install Clang separately if it is missing:
+4. Install the package:
 
-```console
-$ sudo apt-get install --no-install-recommends -y clang
-```
+   ```console
+   $ python -m pip install -e ".[dev]"
+   ```
 
-Optional Qiskit adapter:
+Qiskit is optional. It is necessary only for the Qiskit adapter. To install
+it, use `python -m pip install -e ".[qiskit]"`.
 
-```console
-$ python -m pip install -e ".[qiskit]"
-```
+## Quick start
 
-## Quickstart
+Do these steps in the repository directory.
 
-```console
-$ qcc check examples/add.c --function add
-ok: examples/add.c (add)
+1. Make sure that qcc can compile the function:
 
-$ qcc verify examples/add.c --function add
-ok: add: verified on all 65536 inputs [O3: 25 qubits, 49 gates, T estimate 98]
+   ```console
+   $ qcc check examples/add.c --function add
+   ok: examples/add.c (add)
+   ```
 
-$ qcc compile examples/add.c --function add --opt O3 --emit qasm3 -o add.qasm
-$ qcc stats examples/add.c --function add --opt O3
-```
+2. Compare the circuit with the C function:
 
-The OpenQASM 3 output uses named registers and only the primitive gates:
+   ```console
+   $ qcc verify examples/add.c --function add
+   ok: add: verified on all 65536 inputs [O3: 25 qubits, 49 gates, T estimate 98]
+   ```
 
-```qasm
-OPENQASM 3.0;
-include "stdgates.inc";
+3. Write the circuit to an OpenQASM 3 file:
 
-qubit[8] a;
-qubit[8] b;
-qubit[8] output;
-qubit[1] ancilla;
+   ```console
+   $ qcc compile examples/add.c --function add --opt O3 -o add.qasm
+   ```
 
-cx a[0], output[0];
-```
+4. Show the resource report:
 
-| Command | Purpose |
-| --- | --- |
-| `qcc check` | Compile and validate; `--dump-ir` prints the LLVM IR Clang produced |
-| `qcc compile` | Emit the circuit (`--emit qasm3`) |
-| `qcc stats` | Print the JSON resource report |
-| `qcc verify` | Compile, then check the circuit against the C function's semantics |
+   ```console
+   $ qcc stats examples/add.c --function add --opt O3
+   ```
 
-`compile`, `stats`, and `check` default to `--opt O0`, the stable baseline
-whose resource numbers are comparable across releases. `verify` defaults to
-`O3`. Pass `--opt O3` when you want the small circuit.
-
-## Verification
-
-`qcc verify` (and `qcc.verify.verify` in Python) simulates the compiled
-circuit against a reference evaluation of the parsed function and checks
-three things for each input:
-
-1. the output register holds the function's value,
-2. every input register still holds its argument, and
-3. every work qubit is back in `|0⟩`.
-
-All inputs are swept when the arguments total at most 20 bits (configurable
-with `--exhaustive-bits`); larger functions fall back to a seeded random
-sample, and the report says which happened. A failure is a concrete
-counterexample:
-
-```python
-import qcc
-from qcc.verify import verify
-
-function = qcc.parse_c("examples/add.c", "add")
-circuit = qcc.compile_c(function, function="add", opt=3)
-result = verify(circuit, function)
-assert result.ok and result.exhaustive and result.vectors == 65536
-```
-
-The sweep is bit-sliced: one Python integer carries a wire's value across
-thousands of inputs, so 65,536 inputs take well under a second.
-
-`scripts/fuzz.py` applies the same check to random programs. Each seed builds
-a random SSA function (arithmetic, comparisons, casts, constant division,
-nested `if`/`else` with early returns), compiles it, and verifies it on every
-input:
-
-```console
-$ python scripts/fuzz.py --count 2000 --seed 1
-2000 random functions verified exhaustively at O3 (seeds 1..2000)
-```
-
-## Python API
+You can also use qcc from Python:
 
 ```python
 import qcc
 
-source = """
-#include <stdint.h>
-uint8_t add(uint8_t a, uint8_t b) { return a + b; }
-"""
-
-circuit = qcc.compile_c(source=source, function="add", opt=3)
-report = circuit.report()
-qasm = circuit.to_qasm3()
-
-# qcc.simulate() returns the output-register value.
-output = qcc.simulate(circuit, {"a": 5, "b": 7})
-
-# Circuit.simulate() returns named registers and declared ancillas.
-state = circuit.simulate({"a": 5, "b": 7})
-assert state["output"] == output == 12
+circuit = qcc.compile_c("examples/add.c", function="add", opt=3)
+print(circuit.report().t_count)  # 98
+print(qcc.simulate(circuit, {"a": 5, "b": 7}))  # 12
+print(circuit.to_qasm3())
 ```
 
-Public entry points:
-
-- `qcc.compile_c(...)` — compile C source text, a source path, or a parsed
-  function;
-- `qcc.parse_c(source_or_path, function)` — the validated SSA function, with
-  calls inlined and intrinsics expanded;
-- `qcc.verify.verify(...)` / `assert_verified(...)` — check a circuit against
-  the function it was compiled from;
-- `Circuit.report()` — resource counts and optimizer metadata;
-- `Circuit.to_qasm3()` / `qcc.to_qasm3(...)` — validated OpenQASM 3;
-- `Circuit.to_qiskit()` / `qcc.to_qiskit(...)` — the optional Qiskit adapter;
-- `qcc.simulate(...)` — the standard-library classical simulator.
-
-Registers are LSB-first. Declared ancillas must finish in `0`; the simulator
-checks this by default. The Python API defaults to `opt=1`.
-
-## Supported C subset
-
-The authoritative contract is [docs/supported_c.md](docs/supported_c.md).
-In summary, qcc accepts defined pure functions with fixed-width integer
-arguments and one fixed-width integer result, including:
-
-- addition, subtraction, multiplication, bitwise operations, and casts;
-- every integer comparison, signed and unsigned;
-- `?:`, nested `if`/`else`, and early returns;
-- shifts and rotates by a constant or by a runtime amount;
-- compile-time bounded loops (fully unrolled by Clang);
-- unsigned division and remainder by a nonzero constant;
-- calls to other functions defined in the same file (inlined); and
-- the integer builtins Clang lowers to intrinsics: min/max, `abs`,
-  `__builtin_popcount`, `__builtin_clz`/`ctz`, `__builtin_bswap`, bit
-  reversal, rotates, and saturating add/subtract.
-
-It rejects pointers, arrays, memory, globals, floating point, I/O, recursion,
-external calls, function pointers, inline assembly, `switch`, runtime loops,
-runtime divisors, signed division, and undefined behavior. One unsupported
-function does not poison its file: the other functions in it still compile,
-and the diagnostic for the rejected one names the construct and its source
-line.
-
-```console
-$ qcc check tests/fixtures/v05_mixed.c --function factorial
-qcc: error: tests/fixtures/v05_mixed.c:17:26: error [unsupported-construct]: recursive call @factorial -> @factorial; recursion is not supported because every function call is inlined into one fixed-size circuit
-```
+Refer to [USAGE.md](USAGE.md) for all commands, options, and procedures.
 
 ## Optimization levels
 
-| Level | Behavior |
+| Level | Effect |
 | --- | --- |
-| `O0` | Bennett compute-copy-uncompute baseline: one register per SSA value |
-| `O1` | Reserved; currently produces the `O0` circuit |
-| `O2` | `O0` plus SSA simplification, gate cancellation, eager uncomputation, and clean-ancilla reuse |
-| `O3` | Whole-function dataflow synthesis (below) |
+| `O0` | The baseline. Each value gets its own register. |
+| `O1` | The same circuit as `O0` at this time. |
+| `O2` | `O0`, then removal of unnecessary gates and work qubits. |
+| `O3` | A new circuit from the data flow of the full function. |
 
-`O3` does not lower instruction by instruction. It turns the function into
-one hash-consed expression graph and synthesizes that:
+The commands `compile`, `stats`, and `check` use `O0` if you do not give a
+level. The command `verify` uses `O3`. Use `--opt O3` to get the smallest
+circuit.
 
-- **Free wiring.** Constants, shifts, casts, masks, bitwise NOT, and byte
-  swaps relabel wires instead of emitting gates. A function made only of
-  these compiles to `CX` copies with no Toffoli and no work qubit.
-- **If-conversion.** Branches become a select tree shaped like the source's
-  control flow, so no path-condition logic is synthesized.
-- **In-place arithmetic.** Adders and comparators are Cuccaro-style ripple
-  circuits that borrow the addend's own wires for carries: one ancilla for
-  an n-bit add instead of n. Multiplication is shift-and-add over controlled
-  adders; constant division is in-place restoring division.
-- **Direct output.** The returned value is computed straight into the output
-  register, so only intermediate values pay Bennett's factor of two.
+## Accepted C
 
-All levels obey the same contract: correct output, preserved inputs, clean
-work qubits. A level selects a strategy; it is not a guarantee that a
-particular circuit shrinks. `O3` requires a parsed C function; the legacy
-structural-SSA dictionary input compiles at `O2` and the report says so.
+qcc accepts a function that has integer arguments and one integer result. The
+function must not have side effects.
 
-Resource reports distinguish logical MCX operations from the primitive
-`X`/`CX`/`CCX` decomposition. T counts use the seven-T-per-CCX convention and
-are estimates, not hardware measurements. An `O3` report includes the `O0`
-circuit's figures as its `before` snapshot.
+- Accepted: `+`, `-`, `*`, bit operations, casts, all comparisons, `?:`, `if`
+  and `else`, `switch`, shifts, rotations, loops with a constant limit, and
+  division by a constant. Calls to functions in the same file are also
+  accepted.
+- Not accepted: pointers, arrays, global variables, floating-point values,
+  input and output, recursion, and calls to external functions.
+- Also not accepted: loops without a constant limit, division by a variable,
+  and signed division.
 
-```console
-$ python scripts/benchmarks.py           # regenerate docs/benchmarks.md
-$ python scripts/benchmarks.py --smoke   # non-destructive check
-```
+If one function in a file is not accepted, qcc can compile the other
+functions in that file. Refer to [DOCUMENTATION.md](DOCUMENTATION.md) for the
+full rules.
 
-## Grover example
+## Documentation
 
-```console
-$ python examples/grover_demo.py --no-qiskit
-```
+| Document | Contents |
+| --- | --- |
+| [USAGE.md](USAGE.md) | Installation, commands, the Python interface, and troubleshooting |
+| [DOCUMENTATION.md](DOCUMENTATION.md) | The circuit rules, the accepted C, the levels, and the limits |
+| [docs/supported_c.md](docs/supported_c.md) | The detailed contract for the accepted C |
+| [docs/design.md](docs/design.md) | The internal design |
+| [docs/benchmarks.md](docs/benchmarks.md) | The measured data |
+| [docs/decisions.md](docs/decisions.md) | The design decisions and their causes |
+| [CHANGELOG.md](CHANGELOG.md) | The changes in each version |
 
-The deterministic fallback finds the expected solution `[6]` for the
-checked-in three-bit oracle. With Qiskit installed the demo can also use
-statevector/Aer tooling. See [examples/README.md](examples/README.md) for the
-other fixtures.
+The files README.md, USAGE.md, and DOCUMENTATION.md use the writing rules of
+ASD-STE100 Simplified Technical English.
 
-## Development
+## Tests
+
+These four commands must give no errors before each change is accepted:
 
 ```console
 $ ruff check .
@@ -285,21 +221,14 @@ $ mypy --strict src
 $ pytest -q
 ```
 
-CI runs this gate on Python 3.10 through 3.14 with Clang installed. Tests
-that need Qiskit's OpenQASM 3 importer are skipped when it is unavailable.
+The script `scripts/fuzz.py` makes random functions. It compiles each
+function and compares the circuit with the function for each input:
 
-## Documentation
-
-- [Supported C subset](docs/supported_c.md) — acceptance and diagnostic
-  contract;
-- [Architecture and invariants](docs/design.md) — frontend, lowering,
-  synthesis, layout, QASM, and optimizer design;
-- [Measured benchmarks](docs/benchmarks.md) — generated resource rows;
-- [Architecture decisions](docs/decisions.md) — non-obvious semantic and
-  implementation decisions;
-- [Implementation plan](docs/plan.md) — milestone history and boundaries;
-- [Changelog](CHANGELOG.md).
+```console
+$ python scripts/fuzz.py --count 2000 --seed 1
+2000 random functions verified exhaustively at O3 (seeds 1..2000)
+```
 
 ## License
 
-qcc is distributed under the [MIT License](LICENSE).
+qcc has the [MIT License](LICENSE).
