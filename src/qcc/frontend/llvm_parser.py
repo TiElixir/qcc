@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from qcc.errors import (
@@ -33,6 +33,7 @@ from qcc.ir.ssa import (
     IntType,
     MetadataAttachment,
     Module,
+    Operand,
     Parameter,
     PhiIncoming,
     SSAValue,
@@ -366,15 +367,14 @@ def _parse_type(value: str, location: SourceLocation) -> IntType:
         if _FLOAT_WORD_RE.search(value) or value.strip() in {"float", "double"}:
             raise UnsupportedConstructError(
                 "floating-point type",
-                "floating-point values are not supported; qcc v0.1 accepts "
+                "floating-point values are not supported; qcc accepts "
                 "integer types only",
                 location,
             )
         if _VECTOR_RE.search(value):
             raise UnsupportedConstructError(
                 "vector type",
-                "vector types are not supported; qcc v0.1 accepts scalar "
-                "integer types only",
+                "vector types are not supported; qcc accepts scalar integer types only",
                 location,
             )
         raise LLVMParseError(f"expected an integer type, got {value!r}", location)
@@ -589,7 +589,7 @@ def _operand(
     if value.startswith("@"):
         raise UnsupportedConstructError(
             "global or function operand",
-            "global variables and function references are not supported in v0.1",
+            "global variables and function references are not supported",
             location,
         )
     if value in {"undef", "poison", "zeroinitializer"}:
@@ -620,7 +620,7 @@ def _operand(
     if _FLOAT_WORD_RE.search(value) or re.search(r"[0-9]\.[0-9]", value):
         raise UnsupportedConstructError(
             "floating-point constant",
-            "floating-point values are not supported; qcc v0.1 accepts "
+            "floating-point values are not supported; qcc accepts "
             "integer constants only",
             location,
         )
@@ -666,26 +666,28 @@ def _unsupported_opcode(opcode: str, location: SourceLocation) -> None:
     if opcode in {"sdiv", "srem"}:
         message = (
             f"unsupported LLVM instruction {opcode!r}; signed division and "
-            "remainder are unsupported in v0.3; use unsigned operations with "
-            "a documented constant divisor"
+            "remainder are not supported; use unsigned division or remainder "
+            "by a nonzero constant"
         )
     elif opcode == "call" or opcode.endswith("call") or opcode in {"invoke", "callbr"}:
         message = (
-            f"unsupported LLVM instruction {opcode!r}; function calls are not "
-            "supported in the integer v0.2 frontend"
+            f"unsupported LLVM instruction {opcode!r}; only direct calls to "
+            "functions defined in the same file are supported"
         )
     elif opcode in _CONTROL_FLOW_OPS:
         message = (
             f"unsupported LLVM instruction {opcode!r}; only br/ret control flow "
-            "with an acyclic CFG is supported in v0.2"
+            "with an acyclic CFG is supported"
         )
     elif opcode in _MEMORY_OPS:
         message = (
             f"unsupported LLVM instruction {opcode!r}; loads, stores, pointers, "
-            "and memory operations are not supported in the integer v0.2 frontend"
+            "and memory operations are not supported"
         )
     elif opcode in _UNSUPPORTED_OPS:
-        message = f"unsupported LLVM instruction {opcode!r} in the v0.2 integer subset"
+        message = (
+            f"unsupported LLVM instruction {opcode!r}; it is outside the integer subset"
+        )
     else:
         raise UnsupportedConstructError(
             f"unknown LLVM instruction {opcode!r}",
@@ -870,16 +872,20 @@ def _parse_instruction(
     forward_names: set[str] | None = None,
     debug_locations: Mapping[int, SourceLocation] | None = None,
     defined_functions: frozenset[str] = frozenset(),
+    fallback_location: SourceLocation | None = None,
 ) -> Instruction | None:
-    """Parse one instruction line; ``None`` means a value-free no-op."""
+    """Parse one instruction line; ``None`` means a value-free no-op.
 
-    base, metadata = _extract_metadata(
-        line.strip(),
-        _location(source_name, line_number, line),
-    )
+    ``fallback_location`` is the position reported for an instruction that has
+    no usable ``!dbg`` attachment.  Without it the position is the line of the
+    LLVM text itself, which is only right when that text is the user's input.
+    """
+
+    text_location = _location(source_name, line_number, line)
+    base, metadata = _extract_metadata(line.strip(), text_location)
     location = _location_from_dbg(
         metadata,
-        _location(source_name, line_number, line),
+        fallback_location or text_location,
         debug_locations,
     )
     result_name: str | None = None
@@ -911,17 +917,22 @@ def _parse_instruction(
     if _FLOAT_WORD_RE.search(rest) or (opcode.startswith("f") and opcode != "freeze"):
         raise UnsupportedConstructError(
             "floating-point instruction",
-            f"floating-point instruction {opcode!r} is not supported in the "
-            "integer v0.2 frontend",
+            f"floating-point instruction {opcode!r} is not supported; qcc "
+            "accepts integer operations only",
             location,
         )
     if _VECTOR_RE.search(rest):
         raise UnsupportedConstructError(
             "vector instruction",
-            f"vector operands or results in {opcode!r} are not supported in "
-            "the integer v0.2 frontend",
+            f"vector operands or results in {opcode!r} are not supported; "
+            "qcc accepts scalar integer operations only",
             location,
         )
+
+    if opcode == "unreachable":
+        # Kept only until the function's blocks are finished: a block that
+        # nothing branches to is dropped there, and any other is rejected.
+        return Instruction("unreachable", source_location=location, metadata=metadata)
 
     if opcode in _BINARY_OPS:
         match = re.match(
@@ -1001,8 +1012,8 @@ def _parse_instruction(
         if predicate not in _ICMP_PREDICATES:
             raise UnsupportedConstructError(
                 f"icmp predicate {predicate!r}",
-                f"icmp predicate {predicate!r} is not supported in the "
-                "integer v0.2 frontend",
+                f"icmp predicate {predicate!r} is not supported; qcc accepts "
+                "the ten integer predicates only",
                 location,
             )
         value_type = _parse_type(match.group("type"), location)
@@ -1220,7 +1231,7 @@ def _parse_parameters(
         if item == "...":
             raise UnsupportedConstructError(
                 "variadic function parameter",
-                "variadic functions are not supported in the integer v0.1 subset",
+                "variadic functions are not supported",
                 location,
             )
         name_matches = re.findall(name_pattern, item)
@@ -1248,7 +1259,7 @@ def _parse_parameters(
             if _FLOAT_WORD_RE.search(item) or _VECTOR_RE.search(item):
                 raise UnsupportedConstructError(
                     "non-scalar function parameter",
-                    "function parameters must be scalar integer values in v0.1",
+                    "function parameters must be scalar integer values",
                     location,
                 )
             raise LLVMParseError(
@@ -1324,19 +1335,19 @@ def _parse_function_header(
         if _FLOAT_WORD_RE.search(prefix):
             raise UnsupportedConstructError(
                 "floating-point function return type",
-                "floating-point function signatures are not supported in v0.1",
+                "floating-point function signatures are not supported",
                 location,
             )
         if _VECTOR_RE.search(prefix):
             raise UnsupportedConstructError(
                 "vector function return type",
-                "vector function signatures are not supported in v0.1",
+                "vector function signatures are not supported",
                 location,
             )
         if "ptr" in prefix or "*" in prefix:
             raise UnsupportedConstructError(
                 "pointer function return type",
-                "pointer-typed functions are not supported in the integer v0.1 subset",
+                "pointer-typed functions are not supported",
                 location,
             )
         raise LLVMParseError(
@@ -1446,8 +1457,8 @@ def _validate_function(function: Function) -> None:
                 )
                 raise UnsupportedConstructError(
                     "cyclic control flow",
-                    "cyclic control flow (data-dependent loop) is not supported "
-                    f"in v0.2; branch from %{block.name} to %{target} creates a cycle",
+                    "cyclic control flow (data-dependent loop) is not supported; "
+                    f"branch from %{block.name} to %{target} creates a cycle",
                     location,
                 )
             if target_state == 0:
@@ -1534,6 +1545,15 @@ def _parse_function(
             function_location=function_location,
             debug_locations=debug_locations,
         )
+    # A function location that came from debug metadata is a position in the
+    # C source.  It stands in for any instruction without a location of its
+    # own, so a diagnostic never reports a line of the generated LLVM text as
+    # if it were a line of the user's file.
+    source_fallback = (
+        function_location
+        if function_location != _location(source_name, line_number, header)
+        else None
+    )
     for body_line_index in range(cursor + 1, len(lines)):
         body_line = _strip_comment(lines[body_line_index])
         if body_line.strip() == "}":
@@ -1542,7 +1562,7 @@ def _parse_function(
             loop_location = _location(source_name, body_line_index + 1, body_line)
             _, loop_metadata = _extract_metadata(body_line, loop_location)
             loop_location = _location_from_dbg(
-                loop_metadata, loop_location, debug_locations
+                loop_metadata, source_fallback or loop_location, debug_locations
             )
             raise UnsupportedConstructError(
                 "cyclic control flow",
@@ -1599,7 +1619,7 @@ def _parse_function(
                 name,
                 return_type,
                 parameters,
-                tuple(blocks),
+                tuple(_finish_blocks(blocks, set(values))),
                 attributes,
                 function_location,
             )
@@ -1632,6 +1652,20 @@ def _parse_function(
                 "instructions are not allowed after a terminator without a label",
                 _location(source_name, current_line, current),
             )
+        switch = _joined_switch(lines, cursor)
+        if switch is not None:
+            switch_text, consumed = switch
+            instructions.append(
+                _parse_switch(
+                    switch_text,
+                    values,
+                    _location(source_name, current_line, current),
+                    debug_locations=debug_locations,
+                    fallback_location=source_fallback,
+                )
+            )
+            cursor += consumed
+            continue
         instruction = _parse_instruction(
             current,
             source_name=source_name,
@@ -1641,6 +1675,7 @@ def _parse_function(
             forward_names=forward_names,
             debug_locations=debug_locations,
             defined_functions=defined_functions,
+            fallback_location=source_fallback,
         )
         if instruction is None:
             cursor += 1
@@ -1659,6 +1694,306 @@ def _parse_function(
         f"function @{name} is missing its closing '}}'",
         function_location,
     )
+
+
+_SWITCH_RE = re.compile(
+    r"^switch\s+(?P<type>i[1-9][0-9]*)\s+(?P<value>[^,\s]+)\s*,\s*"
+    r"(?P<default>label\s+[^\s\[]+)\s*\[(?P<cases>.*)\]$"
+)
+_SWITCH_CASE_RE = re.compile(
+    r"(?P<type>i[1-9][0-9]*)\s+(?P<value>[^,\s]+)\s*,\s*(?P<target>label\s+\S+)"
+)
+
+
+def _joined_switch(lines: list[str], start: int) -> tuple[str, int] | None:
+    """Return a ``switch`` as one line plus the number of lines it spans.
+
+    LLVM prints one case per line and puts the ``!dbg`` attachment after the
+    closing bracket, so the first line alone is neither a whole instruction
+    nor a source position.  Any other text yields ``None``.
+    """
+
+    first = _strip_comment(lines[start]).strip()
+    if not first.startswith("switch "):
+        return None
+    if "]" in first:
+        return first, 1
+    parts = [first]
+    for index in range(start + 1, len(lines)):
+        part = _strip_comment(lines[index]).strip()
+        parts.append(part)
+        if part.startswith("]"):
+            return " ".join(parts), len(parts)
+        if part == "}":
+            break
+    return None
+
+
+def _parse_switch(
+    text: str,
+    values: dict[str, SSAValue],
+    text_location: SourceLocation,
+    *,
+    debug_locations: Mapping[int, SourceLocation] | None,
+    fallback_location: SourceLocation | None,
+) -> Instruction:
+    """Parse a ``switch`` into its selector, case constants, and targets.
+
+    The operands are the selector followed by one constant per case; the
+    targets are the default label followed by one label per case.  The
+    instruction only lives until :func:`_lower_switches` rewrites it.
+    """
+
+    base, metadata = _extract_metadata(text, text_location)
+    location = _location_from_dbg(
+        metadata, fallback_location or text_location, debug_locations
+    )
+    match = _SWITCH_RE.match(base)
+    if match is None:
+        raise LLVMParseError("malformed switch instruction", location)
+    value_type = _parse_type(match.group("type"), location)
+    selector = _operand(match.group("value"), value_type, values, location)
+    operands: list[SSAValue | IntConstant] = [selector]
+    targets = [_label_target(match.group("default"), location)]
+    cases = match.group("cases")
+    position = 0
+    for case in _SWITCH_CASE_RE.finditer(cases):
+        if cases[position : case.start()].strip():
+            raise LLVMParseError("malformed switch case list", location)
+        position = case.end()
+        if _parse_type(case.group("type"), location) != value_type:
+            raise LLVMParseError(
+                "switch case type does not match the selector type", location
+            )
+        constant = _operand(case.group("value"), value_type, values, location)
+        if not isinstance(constant, IntConstant):
+            raise LLVMParseError("switch case value must be a constant", location)
+        operands.append(constant)
+        targets.append(_label_target(case.group("target"), location))
+    if cases[position:].strip():
+        raise LLVMParseError("malformed switch case list", location)
+    return Instruction(
+        "switch",
+        type=value_type,
+        operands=tuple(operands),
+        source_location=location,
+        metadata=metadata,
+        targets=tuple(targets),
+    )
+
+
+def _finish_blocks(blocks: list[BasicBlock], value_names: set[str]) -> list[BasicBlock]:
+    """Reduce a parsed function body to ``br``/``ret`` control flow.
+
+    Switches become branch chains, and an ``unreachable`` block that no
+    branch names any more is dropped.  One that is still a branch target
+    marks undefined behavior the compiler cannot rule out, and is rejected.
+    """
+
+    if not any(
+        block.instructions[-1].opcode in {"switch", "unreachable"} for block in blocks
+    ):
+        return blocks
+    lowered = _lower_switches(blocks, value_names)
+    targeted = {
+        target for block in lowered for target in block.instructions[-1].targets
+    }
+    finished: list[BasicBlock] = []
+    for index, block in enumerate(lowered):
+        terminator = block.instructions[-1]
+        if terminator.opcode != "unreachable":
+            finished.append(block)
+        elif index == 0 or block.name in targeted:
+            raise UnsupportedConstructError(
+                "LLVM instruction 'unreachable'",
+                "this function can reach code that has undefined behavior "
+                "(an LLVM 'unreachable' instruction); only functions that are "
+                "defined for every input are supported",
+                terminator.source_location,
+            )
+    return finished
+
+
+def _fresh_name(base: str, used: set[str]) -> str:
+    candidate = base
+    suffix = 1
+    while candidate in used:
+        candidate = f"{base}.{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _lower_switches(
+    blocks: list[BasicBlock], value_names: set[str]
+) -> list[BasicBlock]:
+    """Rewrite every ``switch`` as a chain of equality tests and branches.
+
+    Clang emits ``switch`` not only for a C ``switch`` statement but for any
+    run of ``==`` tests on one value, such as an ``if``/``else if`` chain.
+    Each distinct case target gets one test (the OR of its case values) and
+    one two-way branch; the last branch falls through to the default label.
+    Later stages therefore see ordinary ``icmp``/``br`` control flow.
+
+    A phi in a target block named the switch block as its predecessor.  Its
+    edge now arrives from whichever chain block performs that target's test,
+    so the phi edges are renamed to match.
+    """
+
+    bit = IntType(1)
+    # Clang points the default label at an ``unreachable`` block when the
+    # cases cover every possible value.  That edge is never taken, so the
+    # last case target takes its place as the fall-through.
+    dead = {
+        block.name for block in blocks if block.instructions[0].opcode == "unreachable"
+    }
+    block_names = {block.name for block in blocks}
+    lowered: list[BasicBlock] = []
+    # (target block, original predecessor) -> the blocks that now branch there
+    arrivals: dict[tuple[str, str], list[str]] = {}
+    for block in blocks:
+        switch = block.instructions[-1]
+        if switch.opcode != "switch":
+            lowered.append(block)
+            continue
+        location = switch.source_location
+        selector = switch.operands[0]
+        default = switch.targets[0]
+        groups: dict[str, list[Operand]] = {}
+        for constant, target in zip(
+            switch.operands[1:], switch.targets[1:], strict=True
+        ):
+            if target != default:
+                groups.setdefault(target, []).append(constant)
+        fallthrough = default
+        if default in dead and groups:
+            fallthrough = list(groups)[-1]
+            del groups[fallthrough]
+        body = list(block.instructions[:-1])
+        current = block.name
+        current_location = block.source_location
+        if not groups:
+            body.append(
+                Instruction("br", source_location=location, targets=(fallthrough,))
+            )
+            lowered.append(BasicBlock(current, tuple(body), current_location))
+            arrivals.setdefault((fallthrough, block.name), []).append(current)
+            continue
+        remaining = len(groups)
+        for target, constants in groups.items():
+            remaining -= 1
+            condition: SSAValue | None = None
+            for constant in constants:
+                test = SSAValue(_fresh_name(f"{block.name}.case", value_names), bit)
+                body.append(
+                    Instruction(
+                        "icmp",
+                        result=test,
+                        type=bit,
+                        operands=(selector, constant),
+                        predicate="eq",
+                        operand_type=selector.type,
+                        source_location=location,
+                    )
+                )
+                if condition is None:
+                    condition = test
+                    continue
+                either = SSAValue(_fresh_name(f"{block.name}.case", value_names), bit)
+                body.append(
+                    Instruction(
+                        "or",
+                        result=either,
+                        type=bit,
+                        operands=(condition, test),
+                        source_location=location,
+                    )
+                )
+                condition = either
+            assert condition is not None
+            following = (
+                fallthrough
+                if remaining == 0
+                else _fresh_name(f"{block.name}.switch", block_names)
+            )
+            body.append(
+                Instruction(
+                    "br",
+                    type=bit,
+                    operands=(condition,),
+                    source_location=location,
+                    targets=(target, following),
+                )
+            )
+            lowered.append(BasicBlock(current, tuple(body), current_location))
+            arrivals.setdefault((target, block.name), []).append(current)
+            if remaining == 0:
+                arrivals.setdefault((fallthrough, block.name), []).append(current)
+            current, body, current_location = following, [], location
+
+    renamed: list[BasicBlock] = []
+    for block in lowered:
+        instructions: list[Instruction] = []
+        for instruction in block.instructions:
+            if instruction.opcode != "phi":
+                instructions.append(instruction)
+                continue
+            edges: list[PhiIncoming] = []
+            moved: set[str] = set()
+            for edge in instruction.incoming:
+                sources = arrivals.get((block.name, edge.block))
+                if sources is None:
+                    edges.append(edge)
+                elif edge.block not in moved:
+                    # LLVM lists a switch predecessor once per case; every
+                    # such entry carries the same value.
+                    moved.add(edge.block)
+                    edges.extend(
+                        PhiIncoming(edge.value, source, edge.source_location)
+                        for source in sources
+                    )
+            instructions.append(
+                replace(
+                    instruction,
+                    operands=tuple(edge.value for edge in edges),
+                    incoming=tuple(edges),
+                )
+            )
+        renamed.append(
+            BasicBlock(block.name, tuple(instructions), block.source_location)
+        )
+    return renamed
+
+
+def _global_location(
+    name: str,
+    source_name: str,
+    text_location: SourceLocation,
+    *,
+    from_c: bool,
+) -> SourceLocation:
+    """Return where a rejected global variable is declared.
+
+    Clang's line tables carry no position for a global, so the declaration is
+    found by name in the C file: an identifier is declared before it is used,
+    and its first mention is therefore the declaration.  When that file cannot
+    be read the diagnostic names the file only; the line of the LLVM text is
+    reported only for LLVM text the caller supplied directly.
+    """
+
+    if source_name not in {"<llvm>", "<stdin>"}:
+        try:
+            source_lines = Path(source_name).read_text().splitlines()
+        except OSError:
+            source_lines = []
+        mention = re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(name)}(?![A-Za-z0-9_$])")
+        for source_line_number, source_line in enumerate(source_lines, 1):
+            match = mention.search(source_line)
+            if match is not None:
+                return SourceLocation(
+                    source_name, source_line_number, match.start() + 1
+                )
+    return SourceLocation(source_name) if from_c else text_location
 
 
 _DEFINE_NAME_RE = re.compile(
@@ -1799,20 +2134,19 @@ def parse_module(
                 continue
             name_match = re.match(r"^@?([A-Za-z_.$][A-Za-z0-9_.$-]*)\s*=", stripped)
             fallback = _location(source_name, line_number, raw)
-            if name_match and source_name not in {"<llvm>", "<stdin>"}:
-                try:
-                    source_lines = Path(source_name).read_text().splitlines()
-                except OSError:
-                    source_lines = []
-                needle = name_match.group(1).lstrip("@")
-                for source_line_number, source_line in enumerate(source_lines, 1):
-                    if re.search(rf"\b{re.escape(needle)}\b\s*=", source_line):
-                        fallback = SourceLocation(source_name, source_line_number, 1)
-                        break
+            subject = "a global variable"
+            if name_match is not None:
+                subject = f"global variable @{name_match.group(1)}"
+                fallback = _global_location(
+                    name_match.group(1),
+                    source_name,
+                    fallback,
+                    from_c=bool(debug_locations),
+                )
             global_error = UnsupportedConstructError(
                 "global definition",
-                "global mutable state, global variables, and global initializers "
-                "are not supported",
+                f"{subject}: global mutable state, global variables, and global "
+                "initializers are not supported",
                 fallback,
             )
             if strict:
